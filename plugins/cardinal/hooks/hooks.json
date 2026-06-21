@@ -1,0 +1,36 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "initiative-convention.py", "timeout": 5 },
+          { "type": "command", "command": "plan-state.py", "timeout": 10 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "git-state.py", "timeout": 10 },
+          { "type": "command", "command": "limits-gate.py", "timeout": 5 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "spawn_agent",
+        "hooks": [
+          { "type": "command", "command": "subagent-usage.py", "timeout": 10 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "turn-usage.py", "timeout": 10 },
+          { "type": "command", "command": "plan-usage.py", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}

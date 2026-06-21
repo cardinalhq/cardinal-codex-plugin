@@ -1,0 +1,20 @@
+{
+  "name": "cardinalhq-codex-plugin",
+  "interface": {
+    "displayName": "CardinalHQ"
+  },
+  "plugins": [
+    {
+      "name": "cardinal",
+      "source": {
+        "source": "local",
+        "path": "./plugins/cardinal"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

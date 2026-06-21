@@ -1,0 +1,32 @@
+{
+  "name": "cardinal",
+  "version": "0.1.0",
+  "description": "Connect Codex CLI to Cardinal: telemetry to the Outcomes Dashboard + the unified Cardinal MCP server.",
+  "author": {
+    "name": "CardinalHQ",
+    "url": "https://cardinalhq.io"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Cardinal",
+    "shortDescription": "Telemetry + unified Cardinal MCP for Codex.",
+    "longDescription": "Streams Codex agent sessions to the Cardinal Outcomes Dashboard and wires the unified cardinal MCP server in one browser-approved consent.",
+    "developerName": "CardinalHQ",
+    "category": "Developer Tools",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Connect Codex to Cardinal.",
+      "Show my Cardinal connection status."
+    ]
+  },
+  "homepage": "https://github.com/cardinalhq/cardinal-codex-plugin",
+  "repository": "https://github.com/cardinalhq/cardinal-codex-plugin",
+  "license": "Apache-2.0",
+  "keywords": [
+    "observability",
+    "telemetry",
+    "cardinal",
+    "mcp",
+    "otel"
+  ]
+}

@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""cardinal-disconnect — remove the Cardinal Codex plugin's config.
+
+What gets removed:
+  - The [otel] block from ~/.codex/config.toml (unless --keep-telemetry).
+  - The cardinal MCP server from ~/.codex/config.toml — via
+    `codex mcp remove cardinal` when it was added that way, else by
+    stripping [mcp_servers.cardinal] directly.
+  - Cardinal-managed entries from ~/.codex/hooks.json, identified by the
+    plugin hooks-dir command-path prefix (supacode / unrelated entries
+    are left untouched).
+  - ~/.codex/cardinal.json (state file), unless --keep-telemetry.
+
+What gets revoked server-side (best effort):
+  - The MCP API key, via POST <host>/api/maestro-keys/<mcp_key_id>/revoke.
+    Authenticates as the key itself (R11 §1 "self" path) using the
+    plaintext from CARDINAL_MCP_API_KEY if present in the shell.
+  - The ingest key is NOT revoked here yet — the maestro endpoint hasn't
+    shipped. The script prints a pointer to the admin UI.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+CODEX_DIR = Path.home() / ".codex"
+CONFIG_PATH = CODEX_DIR / "config.toml"
+STATE_PATH = CODEX_DIR / "cardinal.json"
+HOOKS_PATH = CODEX_DIR / "hooks.json"
+
+# Top-level config.toml tables this plugin owns.
+OTEL_TABLE = "otel"
+MCP_TABLE = "mcp_servers.cardinal"
+
+
+def _plugin_hooks_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "hooks"
+
+
+def backup(path: Path) -> "Path | None":
+    if not path.exists():
+        return None
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    bk = path.with_suffix(f"{path.suffix}.bak.{ts}")
+    bk.write_text(path.read_text())
+    return bk
+
+
+def revoke_mcp_key(host: str, key_id: str, plaintext: "str | None") -> tuple[bool, str]:
+    """Best-effort POST /api/maestro-keys/<id>/revoke. Authenticates with the
+    plaintext (R11 §1 self path); without it the server returns 403 and we
+    point the user at the admin UI."""
+    url = host.rstrip("/") + f"/api/maestro-keys/{key_id}/revoke"
+    headers = {"content-type": "application/json"}
+    if plaintext:
+        headers["X-CardinalHQ-API-Key"] = plaintext
+    req = urllib.request.Request(url, data=b"", method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status in (200, 204), f"HTTP {resp.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except (urllib.error.URLError, TimeoutError) as e:
+        return False, f"network error: {e}"
+
+
+def _strip_toml_table(raw: str, header: str) -> tuple[str, bool]:
+    """Remove a single TOML table (the `[header]` line and every line up to
+    the next table header or EOF) from raw text, preserving everything else.
+    Returns (new_text, removed?)."""
+    lines = raw.splitlines(keepends=True)
+    out: list = []
+    skipping = False
+    removed = False
+    for line in lines:
+        s = line.strip()
+        is_header = s.startswith("[") and s.endswith("]")
+        if is_header:
+            inner = s[2:-2].strip() if s.startswith("[[") else s[1:-1].strip()
+            if inner == header:
+                skipping = True
+                removed = True
+                continue
+            skipping = False
+        if skipping:
+            continue
+        out.append(line)
+    return "".join(out), removed
+
+
+def remove_config_tables(tables: list) -> list:
+    """Strip the given tables from config.toml text-level, preserving
+    unrelated content. Returns the list of tables actually removed."""
+    if not CONFIG_PATH.exists():
+        return []
+    raw = CONFIG_PATH.read_text()
+    removed: list = []
+    for header in tables:
+        raw, did = _strip_toml_table(raw, header)
+        if did:
+            removed.append(header)
+    if removed:
+        # Tidy up trailing blank lines.
+        raw = raw.rstrip("\n") + "\n" if raw.strip() else ""
+        CONFIG_PATH.write_text(raw)
+    return removed
+
+
+def remove_mcp_server(added_via: "str | None") -> str:
+    """Remove the cardinal MCP server. Prefer `codex mcp remove cardinal`
+    (mirrors how connect added it); fall back to stripping the table.
+    Returns a human-readable description of what happened."""
+    codex = shutil.which("codex")
+    if codex:
+        try:
+            proc = subprocess.run(
+                [codex, "mcp", "remove", "cardinal"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode == 0:
+                return "removed via `codex mcp remove cardinal`"
+        except Exception:
+            pass
+    removed = remove_config_tables([MCP_TABLE])
+    if removed:
+        return "removed [mcp_servers.cardinal] from config.toml"
+    return "no MCP server entry found"
+
+
+def strip_cardinal_hooks() -> int:
+    """Strip cardinal-managed entries from ~/.codex/hooks.json, identified by
+    the plugin hooks-dir command-path prefix. Preserves unrelated entries
+    (e.g. supacode). Returns the number of hook command entries removed."""
+    if not HOOKS_PATH.exists():
+        return 0
+    try:
+        data = json.loads(HOOKS_PATH.read_text())
+    except Exception as e:
+        sys.exit(f"refusing to modify: {HOOKS_PATH} is malformed ({e})")
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return 0
+
+    hooks_dir_prefix = str(_plugin_hooks_dir())
+    removed = 0
+    for event in list(hooks.keys()):
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        cleaned_groups = []
+        for group in groups:
+            if not isinstance(group, dict):
+                cleaned_groups.append(group)
+                continue
+            entries = group.get("hooks")
+            if not isinstance(entries, list):
+                cleaned_groups.append(group)
+                continue
+            kept = []
+            for e in entries:
+                cmd = e.get("command", "") if isinstance(e, dict) else ""
+                if isinstance(cmd, str) and cmd.startswith(hooks_dir_prefix):
+                    removed += 1
+                else:
+                    kept.append(e)
+            if not kept:
+                continue  # whole group was cardinal-only
+            group["hooks"] = kept
+            cleaned_groups.append(group)
+        if cleaned_groups:
+            hooks[event] = cleaned_groups
+        else:
+            del hooks[event]
+
+    if removed:
+        data["hooks"] = hooks
+        HOOKS_PATH.write_text(json.dumps(data, indent=2) + "\n")
+    return removed
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="cardinal-disconnect")
+    p.add_argument("--force", action="store_true",
+                   help="Don't fail if the state file is missing.")
+    p.add_argument("--keep-telemetry", action="store_true",
+                   help="Remove only the MCP side. Keeps the [otel] block and "
+                        "cardinal.json telemetry state in place. Useful for "
+                        "going from telemetry-and-mcp back to telemetry-only "
+                        "without re-running connect.")
+    args = p.parse_args()
+
+    if not STATE_PATH.exists() and not args.force:
+        print("Cardinal is not connected. Nothing to do.")
+        return 0
+
+    state: dict = {}
+    if STATE_PATH.exists():
+        try:
+            state = json.loads(STATE_PATH.read_text())
+        except Exception as e:
+            sys.exit(f"refusing to proceed: {STATE_PATH} is malformed ({e})")
+
+    host = state.get("host") or "https://app.cardinalhq.io"
+    mcp_key_id = state.get("mcp_key_id")
+    ingest_key_id = state.get("ingest_key_id")
+
+    # ---- Revoke MCP key server-side (best effort) ------------------------
+    if mcp_key_id:
+        plaintext = os.environ.get("CARDINAL_MCP_API_KEY")
+        ok, msg = revoke_mcp_key(host, mcp_key_id, plaintext)
+        if ok:
+            print(f"  ✓ Revoked MCP key {state.get('mcp_key_prefix') or mcp_key_id} server-side ({msg})")
+        else:
+            print(f"  ⚠ Could not revoke MCP key server-side ({msg}).")
+            print(f"    Visit {host}/settings/api-keys to revoke it manually.")
+
+    # ---- Remove MCP server from config.toml ------------------------------
+    if mcp_key_id or CONFIG_PATH.exists():
+        bk = backup(CONFIG_PATH)
+        desc = remove_mcp_server(None)
+        print(f"  ✓ MCP server: {desc}")
+        if bk:
+            print(f"    Backup → {bk}")
+
+    # ---- Remove [otel] block (telemetry side) ----------------------------
+    if not args.keep_telemetry and CONFIG_PATH.exists():
+        removed = remove_config_tables([OTEL_TABLE])
+        if removed:
+            print(f"  ✓ Removed [otel] block from {CONFIG_PATH}")
+
+    # ---- Strip cardinal hooks --------------------------------------------
+    if HOOKS_PATH.exists():
+        bk = backup(HOOKS_PATH)
+        n = strip_cardinal_hooks()
+        if n:
+            print(f"  ✓ Removed {n} cardinal hook(s) from {HOOKS_PATH}")
+            if bk:
+                print(f"    Backup → {bk}")
+
+    # ---- State file -------------------------------------------------------
+    if not args.keep_telemetry:
+        if STATE_PATH.exists():
+            STATE_PATH.unlink()
+            print(f"  ✓ Removed {STATE_PATH}")
+        if ingest_key_id:
+            print()
+            print("  Note: the ingest API key is still active server-side. The")
+            print("        device-code-issued ingest revoke endpoint hasn't shipped")
+            print(f"        yet; revoke it via {host}/settings/api-keys when you can.")
+    else:
+        # Re-stamp state with mode=telemetry-only and mcp_* fields stripped.
+        if state:
+            state["mode"] = "telemetry-only"
+            for k in ("mcp_url", "mcp_key_id", "mcp_key_prefix", "mcp_created_at"):
+                state.pop(k, None)
+            STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
+            try:
+                os.chmod(STATE_PATH, 0o600)
+            except OSError:
+                pass
+            print(f"  ✓ Updated {STATE_PATH} → mode=telemetry-only")
+
+    print()
+    print("✓ Local config updated. Start a new Codex thread so it picks up the change.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
