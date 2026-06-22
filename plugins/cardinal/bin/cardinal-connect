@@ -553,6 +553,14 @@ def write_state(
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    # Line-buffer stdout so the approval URL surfaces the instant it's
+    # printed, even when stdout is a pipe (Python block-buffers pipes by
+    # default, which would hide the URL until the 10-min poll returns).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     p = argparse.ArgumentParser(
         prog="cardinal-connect",
         description=(
