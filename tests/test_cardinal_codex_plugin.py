@@ -10,7 +10,8 @@ Covers (per docs/specs/codex-port.md, the authoritative porting contract):
   3. Hook behaviour via SourceFileLoader, HOME redirected to tmp_path:
      not-connected hooks silent-exit with no POST; connected hooks POST the
      right OTLP event with service.name=codex / agent.runtime=codex.
-  4. connect/disconnect config.toml + hooks.json + cardinal.json round-trip
+  4. connect/disconnect config.toml + cardinal.json round-trip; the shipped
+     hooks/hooks.json template Codex auto-registers
      (formalised from /tmp/cardinal_codex_harness.py).
 
 Pytest + stdlib only. No network: urllib is monkeypatched for every POST.
@@ -719,13 +720,10 @@ def seeded_codex(home):
 
 def _rebind_paths(mod, codex: Path):
     """Rebind a connect/disconnect module's module-level path constants to
-    the tmp ~/.codex (they were captured from the real Path.home() at import).
-    `_plugin_hooks_dir()` is left alone — it points at the real installed
-    plugin hooks dir, which is exactly what connect rewrites commands to."""
+    the tmp ~/.codex (they were captured from the real Path.home() at import)."""
     mod.CODEX_DIR = codex
     mod.CONFIG_PATH = codex / "config.toml"
     mod.STATE_PATH = codex / "cardinal.json"
-    mod.HOOKS_PATH = codex / "hooks.json"
     if hasattr(mod, "PENDING_PATH"):
         mod.PENDING_PATH = codex / "cardinal-pending.json"
 
@@ -806,23 +804,33 @@ class TestConnectWritesConfigToml:
         assert oct(mode) == oct(0o600)
 
 
-class TestConnectMergesHooks:
-    def test_supacode_preserved_cardinal_absolute_paths(self, seeded_codex, connect):
+class TestPluginHooksTemplate:
+    """Codex auto-registers the shipped hooks/hooks.json (codex-port.md §5);
+    connect no longer merges hooks. The template's commands must be runnable
+    as-is: relative to the plugin root (`./hooks/<script>.py`), pointing at
+    scripts that exist and are executable. A bare name would fail with 127."""
+
+    def test_commands_are_relative_to_plugin_root_and_exist(self):
+        cmds = _all_hook_commands(HOOKS_DIR / "hooks.json")
+        assert cmds, "template must declare hook commands"
+        for c in cmds:
+            assert c.startswith("./hooks/"), f"hook command not plugin-root-relative: {c}"
+            script = PLUGIN / c[len("./"):]
+            assert script.exists(), f"hook script missing: {c}"
+            assert os.access(script, os.X_OK), f"hook script not executable: {c}"
+
+    def test_connect_does_not_register_hooks(self, seeded_codex, connect):
+        """connect must leave ~/.codex/hooks.json untouched — Codex owns
+        registration, and a merge would double-fire every event."""
         _rebind_paths(connect, seeded_codex)
-        n = connect.merge_hooks()
-        assert n > 0
-        cmds = _all_hook_commands(seeded_codex / "hooks.json")
-        # supacode hook preserved
-        assert any("echo supacode" in c for c in cmds)
-        # cardinal hooks present with ABSOLUTE paths under the plugin hooks dir
-        hooks_prefix = str(HOOKS_DIR)
-        assert any(
-            c.endswith("/git-state.py") and c.startswith(hooks_prefix)
-            for c in cmds
-        )
-        assert any(c.endswith("/subagent-usage.py") for c in cmds)
-        # the spawn_agent matcher rides on the subagent hook group
-        data = json.loads((seeded_codex / "hooks.json").read_text())
+        before = (seeded_codex / "hooks.json").read_text()
+        assert not hasattr(connect, "merge_hooks")
+        # connect exposes no global-hooks path constant anymore
+        assert not hasattr(connect, "HOOKS_PATH")
+        assert (seeded_codex / "hooks.json").read_text() == before
+
+    def test_spawn_agent_matcher_present(self):
+        data = json.loads((HOOKS_DIR / "hooks.json").read_text())
         post = data["hooks"]["PostToolUse"]
         spawn_groups = [g for g in post if g.get("matcher") == "spawn_agent"]
         assert spawn_groups, "subagent hook must carry matcher=spawn_agent"
@@ -830,15 +838,6 @@ class TestConnectMergesHooks:
             "subagent-usage.py" in h["command"]
             for g in spawn_groups for h in g["hooks"]
         )
-
-    def test_merge_is_idempotent(self, seeded_codex, connect):
-        _rebind_paths(connect, seeded_codex)
-        connect.merge_hooks()
-        connect.merge_hooks()
-        cmds = _all_hook_commands(seeded_codex / "hooks.json")
-        # supacode still present exactly once; no duplicate cardinal git-state
-        assert sum("echo supacode" in c for c in cmds) == 1
-        assert sum(c.endswith("/git-state.py") for c in cmds) == 1
 
 
 class TestConnectReachability:
@@ -861,7 +860,7 @@ class TestConnectReachability:
 
 
 class TestDisconnectRoundTrip:
-    def test_removes_cardinal_tables_and_hooks_preserves_rest(
+    def test_removes_cardinal_tables_preserves_rest_and_leaves_hooks(
         self, seeded_codex, connect, disconnect,
     ):
         # First connect-side writes.
@@ -877,12 +876,12 @@ class TestDisconnectRoundTrip:
             BUNDLE["mcp"]["api_key"],
         )
         connect.write_config_toml({"otel": otel, "mcp_servers.cardinal": mcp})
-        connect.merge_hooks()
+
+        hooks_before = (seeded_codex / "hooks.json").read_text()
 
         # Now disconnect.
         _rebind_paths(disconnect, seeded_codex)
         disconnect.remove_config_tables([disconnect.OTEL_TABLE, disconnect.MCP_TABLE])
-        disconnect.strip_cardinal_hooks()
 
         cfg = (seeded_codex / "config.toml").read_text()
         assert "[otel]" not in cfg
@@ -892,7 +891,7 @@ class TestDisconnectRoundTrip:
         assert '[projects."/x"]' in cfg
         assert "[mcp_servers.other]" in cfg
 
-        cmds = _all_hook_commands(seeded_codex / "hooks.json")
-        assert any("echo supacode" in c for c in cmds)        # supacode survives
-        assert not any("git-state.py" in c for c in cmds)     # cardinal stripped
-        assert not any("subagent-usage.py" in c for c in cmds)
+        # disconnect must not touch ~/.codex/hooks.json — Codex owns hook
+        # registration; there are no cardinal entries there to strip.
+        assert not hasattr(disconnect, "strip_cardinal_hooks")
+        assert (seeded_codex / "hooks.json").read_text() == hooks_before
