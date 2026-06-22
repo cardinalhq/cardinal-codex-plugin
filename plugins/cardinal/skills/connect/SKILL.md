@@ -27,48 +27,54 @@ on the Cardinal side never requires re-running this command.
 
 ## How you (the model) should run this
 
-**You MUST run `cardinal-connect` in the background.** The script
-blocks for up to 10 minutes waiting for the user to approve in their
-browser; the Bash tool's stdout is buffered until the call returns, so
-if you don't background it the user never sees the verification URL.
+The script prints the approval URL to stdout within ~2 seconds, then
+**blocks for up to 10 minutes** waiting for the user to approve in their
+browser. So it has to run as a long-lived command whose output you can
+read while it's still running.
 
-Codex does not put the plugin's `bin/` on `$PATH`, so invoke the script
-by its installed absolute path. Resolve it with the Bash tool (picks the
-highest installed version) and run with `run_in_background: true`:
+Codex does not put the plugin's `bin/` on `$PATH`, so invoke it by its
+installed absolute path (the glob picks the highest installed version):
 
 ```
 "$(ls -d "${CODEX_HOME:-$HOME/.codex}"/plugins/cache/*/cardinal/*/bin 2>/dev/null | sort -V | tail -1)/cardinal-connect"
 ```
 
-Then surface the URL via the pending side-channel file:
+### Run it in a background terminal — do NOT detach it
 
-1. After kicking off the background bash call, poll
-   `~/.codex/cardinal-pending.json` — the script writes it within
-   1–2 seconds of starting. Read up to 5 times with 1-second gaps.
-2. Parse the JSON. Shape:
-   ```json
-   {
-     "verification_uri": "https://app.cardinalhq.io/connect?code=ABCD-EFGH",
-     "user_code": "ABCD-EFGH",
-     "expires_in": 600,
-     "written_at": "2026-06-05T05:40:59Z",
-     "plugin_version": "0.1.0"
-   }
-   ```
-3. **Show `verification_uri` to the user prominently** — wrap it in
-   a code fence (a real markdown link is fine too) and say something
-   like "Open this in your browser, log in if needed, pick your org,
-   and click Approve. I'm watching for it." Do NOT block on it
-   yourself; the background bash call is doing that.
-4. Wait for the background bash call to complete. Codex will
-   notify you when it finishes; until then you can answer side
-   questions, but don't run another long-blocking command in the
-   same conversation.
-5. When the background call returns, read its final stdout for the
-   success summary or the error. Surface it to the user verbatim.
+Start it as a **background terminal / long-running command that stays
+attached** (Codex keeps the process alive and streams its output back to
+you). Then read the streamed stdout: the script line-buffers, so the
 
-The pending file is deleted automatically when `cardinal-connect`
-exits — success, denied, expired, or error.
+```
+  Open this URL in your browser to approve:
+    https://app.cardinalhq.io/connect?code=ABCD-EFGH
+```
+
+lines appear almost immediately.
+
+**Do NOT** run it with `run_in_background: true`, `nohup`, a trailing
+`&`, or by redirecting to an `mktemp` log and polling the file. Codex's
+exec wrapper reaps those **detached** children before the script can
+print the URL or write its side-channel file — that path fails every
+time and wastes minutes. An *attached* background terminal is the only
+thing that works.
+
+### Steps
+
+1. Launch `cardinal-connect` in an attached background terminal.
+2. Read the terminal's streamed output and **show the
+   `https://app.cardinalhq.io/connect?code=…` URL to the user
+   prominently** — code fence or markdown link — with: "Open this in
+   your browser, log in if needed, pick your org, and click Approve.
+   I'm watching for it."
+   - Fallback if the stream is slow: the same URL is in
+     `~/.codex/cardinal-pending.json` (`verification_uri` field), written
+     within ~2s and deleted when the script exits.
+3. Wait for the background terminal to finish (the user approving in the
+   browser unblocks it). Until then you can answer side questions; don't
+   start another long-blocking command.
+4. When it finishes, surface its final stdout — the success summary or
+   the error — to the user verbatim.
 
 ### What the script actually does
 
