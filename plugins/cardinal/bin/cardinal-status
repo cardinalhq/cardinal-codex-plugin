@@ -7,9 +7,10 @@ sides depending on the recorded mode. Cross-checks ~/.codex/config.toml
 (cardinal-managed hook commands), then probes both endpoints for
 reachability.
 
-Unlike the Claude version, the ingest/MCP keys live in cardinal.json
-itself (Codex has no settings.json env block), so probes read the key
-straight from state.
+Unlike the Claude version, the ingest key lives in cardinal.json itself
+(Codex has no settings.json env block). New Cardinal MCP registrations
+also keep the MCP key in cardinal.json and in config.toml http_headers;
+legacy registrations may still point Codex at CARDINAL_MCP_API_KEY.
 """
 
 import json
@@ -24,6 +25,8 @@ CODEX_DIR = Path.home() / ".codex"
 CONFIG_PATH = CODEX_DIR / "config.toml"
 STATE_PATH = CODEX_DIR / "cardinal.json"
 HOOKS_PATH = CODEX_DIR / "hooks.json"
+MCP_API_HEADER = "x-cardinalhq-api-key"
+LEGACY_MCP_KEY_ENV_VAR = "CARDINAL_MCP_API_KEY"
 
 
 def load_or_die(path: Path, label: str) -> dict:
@@ -85,11 +88,11 @@ def probe_ingest(endpoint: str, key: str) -> str:
         return f"✗ Ingest network error: {e}"
 
 
-def probe_mcp(mcp_url: str, key: str) -> str:
+def probe_mcp(mcp_url: str, key: str, header_name: str = MCP_API_HEADER) -> str:
     req = urllib.request.Request(
         mcp_url,
         method="GET",
-        headers={"x-cardinalhq-api-key": key},
+        headers={header_name: key},
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -123,6 +126,16 @@ def _cardinal_hook_count() -> int:
                         and entry["command"].startswith(hooks_dir_prefix)):
                     n += 1
     return n
+
+
+def _header_value(headers: object, header_name: str) -> "str | None":
+    if not isinstance(headers, dict):
+        return None
+    wanted = header_name.lower()
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == wanted and isinstance(value, str):
+            return value
+    return None
 
 
 def main() -> int:
@@ -189,18 +202,29 @@ def main() -> int:
         if config_url and config_url != mcp_url_state:
             print(f"  ⚠ config.toml mcp url differs from state ({config_url} vs {mcp_url_state}).")
 
-        # The MCP key isn't stored in state (Codex reads it from the
-        # CARDINAL_MCP_API_KEY env var at session start). Probe with the
-        # ingest key prefix isn't possible; we probe only if the full MCP
-        # key is recoverable from the env var.
+        mcp_header_name = state.get("mcp_api_header") or MCP_API_HEADER
+        mcp_key = state.get("mcp_api_key") or _header_value(
+            cardinal_server.get("http_headers") if isinstance(cardinal_server, dict) else None,
+            mcp_header_name,
+        )
+
         import os as _os
-        mcp_key = _os.environ.get("CARDINAL_MCP_API_KEY")
         if mcp_key:
-            print(f"  {probe_mcp(mcp_url_state, mcp_key)}")
+            print(f"  {probe_mcp(mcp_url_state, mcp_key, mcp_header_name)}")
         else:
-            print("  ⚠ CARDINAL_MCP_API_KEY not set in this shell — skipping live MCP probe.")
-            print("    Codex reads it at session start; set it to probe here, or trust the")
-            print("    config.toml registration above.")
+            legacy_env_name = None
+            if isinstance(cardinal_server, dict):
+                legacy_env_name = cardinal_server.get("bearer_token_env_var")
+            legacy_key = _os.environ.get(legacy_env_name or LEGACY_MCP_KEY_ENV_VAR)
+            if legacy_key:
+                print(f"  {probe_mcp(mcp_url_state, legacy_key, mcp_header_name)}")
+            elif legacy_env_name:
+                print(f"  ⚠ {legacy_env_name} not set; Codex will warn at startup.")
+                print("    This is a legacy MCP registration. Run /cardinal:connect --rotate")
+                print("    to rewrite it with config.toml http_headers.")
+            else:
+                print("  ✗ No MCP key found in cardinal.json or config.toml http_headers.")
+                print("    Run /cardinal:connect --rotate to repair.")
 
     # ---- Hooks -----------------------------------------------------------
     n_hooks = _cardinal_hook_count()

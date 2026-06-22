@@ -686,6 +686,7 @@ BUNDLE = {
     },
     "mcp": {
         "url": "https://app.cardinalhq.io/api/orgs/org-uuid/mcp",
+        "api_header": "x-cardinalhq-api-key",
         "api_key": "mk_SECRET456",
         "key_id": "mk1",
         "key_prefix": "mk_SECR",
@@ -755,6 +756,8 @@ class TestConnectWritesState:
         assert "agent.runtime=codex" in state["resource_attributes"]
         assert "deployment.environment=prod" in state["resource_attributes"]
         assert state["limits"]["status_url"].endswith("/status")
+        assert state["mcp_api_header"] == "x-cardinalhq-api-key"
+        assert state["mcp_api_key"] == "mk_SECRET456"
         assert state["mcp_key_id"] == "mk1"
         # 0600
         mode = stat.S_IMODE(os.stat(seeded_codex / "cardinal.json").st_mode)
@@ -769,7 +772,11 @@ class TestConnectWritesConfigToml:
             BUNDLE["ingest"]["endpoint"], dep,
             BUNDLE["ingest"]["api_header"], BUNDLE["ingest"]["api_key"],
         )
-        mcp = connect._emit_mcp_block(BUNDLE["mcp"]["url"])
+        mcp = connect._emit_mcp_block(
+            BUNDLE["mcp"]["url"],
+            BUNDLE["mcp"]["api_header"],
+            BUNDLE["mcp"]["api_key"],
+        )
         connect.write_config_toml({"otel": otel, "mcp_servers.cardinal": mcp})
 
         cfg = (seeded_codex / "config.toml").read_text()
@@ -782,13 +789,21 @@ class TestConnectWritesConfigToml:
         assert "otlp-http" in cfg
         assert "[mcp_servers.cardinal]" in cfg
         assert "ik_SECRET123" in cfg  # otel headers carry the key
+        assert "http_headers" in cfg
+        assert "mk_SECRET456" in cfg
         # result must still parse as TOML
         import tomllib
         parsed = tomllib.loads(cfg)
         assert parsed["model"] == "gpt-5.5"
         assert "otel" in parsed
         assert parsed["mcp_servers"]["cardinal"]["url"] == BUNDLE["mcp"]["url"]
+        assert parsed["mcp_servers"]["cardinal"]["http_headers"] == {
+            "x-cardinalhq-api-key": "mk_SECRET456",
+        }
+        assert "bearer_token_env_var" not in parsed["mcp_servers"]["cardinal"]
         assert parsed["mcp_servers"]["other"]["command"] == "foo"
+        mode = stat.S_IMODE(os.stat(seeded_codex / "config.toml").st_mode)
+        assert oct(mode) == oct(0o600)
 
 
 class TestConnectMergesHooks:
@@ -826,6 +841,25 @@ class TestConnectMergesHooks:
         assert sum(c.endswith("/git-state.py") for c in cmds) == 1
 
 
+class TestConnectReachability:
+    def test_ingest_401_retry_budget_is_60_seconds(self, connect, monkeypatch):
+        sleeps = []
+
+        monkeypatch.setattr(
+            connect,
+            "_ingest_probe_once",
+            lambda _endpoint, _key: (False, "HTTP 401 — key invalid"),
+        )
+        monkeypatch.setattr(connect.time, "sleep", sleeps.append)
+
+        ok, msg = connect.verify_ingest_reachable("https://otel.example", "ik_test")
+
+        assert ok is False
+        assert sleeps == list(connect._INGEST_PROBE_RETRY_SLEEPS)
+        assert sum(sleeps) == 60.0
+        assert "after 7 attempts over ~60s" in msg
+
+
 class TestDisconnectRoundTrip:
     def test_removes_cardinal_tables_and_hooks_preserves_rest(
         self, seeded_codex, connect, disconnect,
@@ -837,7 +871,11 @@ class TestDisconnectRoundTrip:
             BUNDLE["ingest"]["endpoint"], dep,
             BUNDLE["ingest"]["api_header"], BUNDLE["ingest"]["api_key"],
         )
-        mcp = connect._emit_mcp_block(BUNDLE["mcp"]["url"])
+        mcp = connect._emit_mcp_block(
+            BUNDLE["mcp"]["url"],
+            BUNDLE["mcp"]["api_header"],
+            BUNDLE["mcp"]["api_key"],
+        )
         connect.write_config_toml({"otel": otel, "mcp_servers.cardinal": mcp})
         connect.merge_hooks()
 

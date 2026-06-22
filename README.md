@@ -29,7 +29,7 @@ Or run `bin/cardinal-connect` directly. The plugin prints a `https://app.cardina
 | File | What gets written |
 |---|---|
 | `~/.codex/config.toml` | `[otel]` exporter block (telemetry side) + `[mcp_servers.cardinal]` block (MCP side) |
-| `~/.codex/cardinal.json` | Full ingest key + non-secret state and key ids, read by the hooks and by `/cardinal:status` / `/cardinal:disconnect` (written `0600`) |
+| `~/.codex/cardinal.json` | Full ingest key, MCP key, and connection metadata, read by the hooks and by `/cardinal:status` / `/cardinal:disconnect` (written `0600`) |
 | `~/.codex/hooks.json` | The plugin's `cardinal.*` enrichment hook entries, merged in (unrelated hooks preserved) |
 
 Then **start a new Codex thread/session** — `config.toml` and `hooks.json` are read when a thread starts, so the wiring comes online on the next thread, not the current one.
@@ -64,10 +64,12 @@ Any other keys you have in `config.toml` are left alone. `/cardinal:disconnect` 
 
 ### MCP side
 
-`cardinal-connect` writes a `[mcp_servers.cardinal]` block into `~/.codex/config.toml` pointing at your org's durable aggregator URL with the minted MCP key:
+`cardinal-connect` writes a `[mcp_servers.cardinal]` block into `~/.codex/config.toml` pointing at your org's durable aggregator URL with the minted MCP key in Codex's masked `http_headers` field:
 
-```
-mcp_url = https://<host>/api/orgs/<org-uuid>/mcp
+```toml
+[mcp_servers.cardinal]
+url = "https://<host>/api/orgs/<org-uuid>/mcp"
+http_headers = { "x-cardinalhq-api-key" = "<your key>" }
 ```
 
 The URL points at the **aggregator** — a single durable endpoint that exposes whatever tools your org has integrations for. As your admin enables more integrations on the Cardinal side, the same URL surfaces more tools on the next `tools/list`. **You don't need to re-run `/cardinal:connect` to "see" new tools.**

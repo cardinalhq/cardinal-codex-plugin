@@ -14,7 +14,8 @@ What gets removed:
 What gets revoked server-side (best effort):
   - The MCP API key, via POST <host>/api/maestro-keys/<mcp_key_id>/revoke.
     Authenticates as the key itself (R11 §1 "self" path) using the
-    plaintext from CARDINAL_MCP_API_KEY if present in the shell.
+    plaintext from cardinal.json, or CARDINAL_MCP_API_KEY for legacy
+    env-var based registrations.
   - The ingest key is NOT revoked here yet — the maestro endpoint hasn't
     shipped. The script prints a pointer to the admin UI.
 """
@@ -39,6 +40,7 @@ HOOKS_PATH = CODEX_DIR / "hooks.json"
 # Top-level config.toml tables this plugin owns.
 OTEL_TABLE = "otel"
 MCP_TABLE = "mcp_servers.cardinal"
+LEGACY_MCP_KEY_ENV_VAR = "CARDINAL_MCP_API_KEY"
 
 
 def _plugin_hooks_dir() -> Path:
@@ -214,7 +216,7 @@ def main() -> int:
 
     # ---- Revoke MCP key server-side (best effort) ------------------------
     if mcp_key_id:
-        plaintext = os.environ.get("CARDINAL_MCP_API_KEY")
+        plaintext = state.get("mcp_api_key") or os.environ.get(LEGACY_MCP_KEY_ENV_VAR)
         ok, msg = revoke_mcp_key(host, mcp_key_id, plaintext)
         if ok:
             print(f"  ✓ Revoked MCP key {state.get('mcp_key_prefix') or mcp_key_id} server-side ({msg})")
@@ -259,7 +261,14 @@ def main() -> int:
         # Re-stamp state with mode=telemetry-only and mcp_* fields stripped.
         if state:
             state["mode"] = "telemetry-only"
-            for k in ("mcp_url", "mcp_key_id", "mcp_key_prefix", "mcp_created_at"):
+            for k in (
+                "mcp_url",
+                "mcp_api_header",
+                "mcp_api_key",
+                "mcp_key_id",
+                "mcp_key_prefix",
+                "mcp_created_at",
+            ):
                 state.pop(k, None)
             STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
             try:

@@ -140,13 +140,17 @@ helpers collapse into this module.
 keys — parse with `tomllib` for read, re-serialize minimally or use a targeted
 text merge; do NOT clobber the user's existing config):
 
-- **MCP** — prefer shelling out to `codex mcp add cardinal --url <mcp_url>
-  --bearer-token-env-var CARDINAL_MCP_API_KEY` so Codex owns the exact schema,
-  OR write `[mcp_servers.cardinal]` directly. **VERIFY** whether the Cardinal
-  aggregator accepts `Authorization: Bearer <key>` (what Codex sends) or only
-  the custom `X-CardinalHQ-API-Key` header. If only the custom header, write
-  `[mcp_servers.cardinal]` with a `http_headers`/`headers` table if Codex
-  supports it; otherwise document the server-side Bearer requirement.
+- **MCP** — write `[mcp_servers.cardinal]` directly with Codex's
+  `http_headers` map. Codex 0.141.x accepts and masks `http_headers` in
+  `codex mcp get`, while `codex mcp add` only exposes bearer-token env vars
+  for HTTP servers. Cardinal's aggregator is probed with
+  `X-CardinalHQ-API-Key`, so the emitted table is:
+
+  ```toml
+  [mcp_servers.cardinal]
+  url = "<mcp_url>"
+  http_headers = { "x-cardinalhq-api-key" = "<mcp_key>" }
+  ```
 - **OTel** — write an `[otel]` block so Codex's native exporter streams its own
   session/turn telemetry to Cardinal:
 
