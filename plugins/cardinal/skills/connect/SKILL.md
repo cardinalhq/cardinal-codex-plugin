@@ -84,8 +84,11 @@ exits — success, denied, expired, or error.
    - **`~/.codex/cardinal.json`** — full ingest key, MCP key, and
      connection metadata for `/cardinal:status`, `/cardinal:disconnect`,
      and the hooks.
-   - **`~/.codex/hooks.json`** — merges the plugin's `cardinal.*`
-     enrichment hook entries; unrelated hooks are preserved.
+
+   The `cardinal.*` enrichment hooks are NOT written here — Codex
+   auto-registers the plugin's `hooks/hooks.json` on its own (no
+   `~/.codex/hooks.json` write); they read `~/.codex/cardinal.json` to
+   learn where to POST.
 5. Probes both endpoints to confirm the keys actually authenticate.
 6. Deletes `~/.codex/cardinal-pending.json` on exit.
 
@@ -93,7 +96,8 @@ exits — success, denied, expired, or error.
 
 - `--telemetry-only` — request only the ingest scope. The
   `[mcp_servers.cardinal]` block is NOT written; only the `[otel]`
-  block and the enrichment hooks land.
+  block lands (the enrichment hooks are auto-registered by Codex either
+  way).
 - `--rotate` — proceed even when state shows we're already connected.
   Mints fresh keys; the previous ones stay alive until their TTL or
   until `/cardinal:disconnect` revokes them.
@@ -128,12 +132,13 @@ policies forbid. If the user's org has such a policy, suggest
 
 Tell the user:
 
-1. `~/.codex/config.toml` ( `[otel]` + `[mcp_servers.cardinal]` ),
-   `~/.codex/cardinal.json`, and `~/.codex/hooks.json` have been
-   updated.
+1. `~/.codex/config.toml` ( `[otel]` + `[mcp_servers.cardinal]` ) and
+   `~/.codex/cardinal.json` have been updated. (The plugin's hooks are
+   auto-registered by Codex — no `~/.codex/hooks.json` write.)
 2. **Start a new Codex thread/session** to pick up the plugin. Codex
-   reads `config.toml` and `hooks.json` when a thread starts, so the
-   new wiring comes online on the next thread, not the current one.
+   reads `config.toml` and registers the plugin's hooks when a thread
+   starts, so the new wiring comes online on the next thread, not the
+   current one.
 3. Run `/cardinal:status` from the new session to verify both sides.
 
 ## Errors

@@ -32,8 +32,9 @@ The script reads `~/.codex/cardinal.json` (the state file) and reports:
 - Mode, user email, org, host, plugin version, connection age.
 - **Telemetry side** (when enabled): the ingest endpoint, key prefix,
   whether tool-details capture is on, that the `[otel]` block is present
-  in `~/.codex/config.toml` and the enrichment hooks are merged into
-  `~/.codex/hooks.json`, and a reachability probe.
+  in `~/.codex/config.toml`, that Codex has auto-registered the plugin's
+  enrichment hooks (counted from the `[hooks.state]` entries in
+  `~/.codex/config.toml`), and a reachability probe.
 - **MCP side** (when enabled): the MCP URL, key prefix, that
   `[mcp_servers.cardinal]` is present in `~/.codex/config.toml`, that
   auth is available from `cardinal.json` or `http_headers`, and a

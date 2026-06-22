@@ -30,9 +30,10 @@ Or run `bin/cardinal-connect` directly. The plugin prints a `https://app.cardina
 |---|---|
 | `~/.codex/config.toml` | `[otel]` exporter block (telemetry side) + `[mcp_servers.cardinal]` block (MCP side) |
 | `~/.codex/cardinal.json` | Full ingest key, MCP key, and connection metadata, read by the hooks and by `/cardinal:status` / `/cardinal:disconnect` (written `0600`) |
-| `~/.codex/hooks.json` | The plugin's `cardinal.*` enrichment hook entries, merged in (unrelated hooks preserved) |
 
-Then **start a new Codex thread/session** — `config.toml` and `hooks.json` are read when a thread starts, so the wiring comes online on the next thread, not the current one.
+The plugin's `cardinal.*` enrichment hooks are **not** written into `~/.codex/hooks.json` — Codex auto-registers the plugin's `hooks/hooks.json` directly (tracked in `config.toml` under `[hooks.state]`). connect leaves the global hooks file alone.
+
+Then **start a new Codex thread/session** — `config.toml` is read and the plugin's hooks are registered when a thread starts, so the wiring comes online on the next thread, not the current one.
 
 Run `/cardinal:status` from the new session to verify both sides.
 
@@ -58,7 +59,7 @@ environment = "<deployment_env>"
 exporter = { otlp-http = { endpoint = "<your region's intake host>", protocol = "binary", headers = { "x-cardinalhq-api-key" = "<your key>" } } }
 ```
 
-On top of that, the plugin's hooks (merged into `~/.codex/hooks.json`) POST the `cardinal.*` enrichment events — `cardinal.git_state`, `cardinal.turn_usage`, `cardinal.turn_tool`, `cardinal.subagent_usage`, `cardinal.plan_state`, `cardinal.plan_usage` — directly to the ingest endpoint using the full key in `~/.codex/cardinal.json`. The Outcomes Dashboard consumes the Codex and Claude Code runtimes uniformly.
+On top of that, the plugin's hooks (auto-registered by Codex from the plugin's `hooks/hooks.json`) POST the `cardinal.*` enrichment events — `cardinal.git_state`, `cardinal.turn_usage`, `cardinal.turn_tool`, `cardinal.subagent_usage`, `cardinal.plan_state`, `cardinal.plan_usage` — directly to the ingest endpoint using the full key in `~/.codex/cardinal.json`. The Outcomes Dashboard consumes the Codex and Claude Code runtimes uniformly.
 
 Any other keys you have in `config.toml` are left alone. `/cardinal:disconnect` removes only the blocks above and leaves the rest.
 
@@ -86,7 +87,7 @@ Full prompt text is **never** captured by this plugin. Codex's `[otel]` exporter
 |---|---|
 | `/cardinal:connect` | Runs the device-code flow and wires up both telemetry and MCP. Use `--telemetry-only` to skip the MCP side, `--rotate` to overwrite an existing config. |
 | `/cardinal:status` | Show the configured mode, host, org, both endpoints, key prefixes, connection age, and a reachability probe against each enabled side. |
-| `/cardinal:disconnect` | Best-effort revoke the MCP key server-side (via `/api/maestro-keys/<id>/revoke`), strip the plugin-owned `[otel]` / `[mcp_servers.cardinal]` blocks from `~/.codex/config.toml` and the enrichment hooks from `~/.codex/hooks.json`, and delete `~/.codex/cardinal.json`. The ingest-key revoke endpoint isn't shipped yet; the script points at the admin UI. Use `--keep-telemetry` to disconnect only the MCP side. |
+| `/cardinal:disconnect` | Best-effort revoke the MCP key server-side (via `/api/maestro-keys/<id>/revoke`), strip the plugin-owned `[otel]` / `[mcp_servers.cardinal]` blocks from `~/.codex/config.toml`, and delete `~/.codex/cardinal.json`. The enrichment hooks are left to Codex (they no-op once the state file is gone, and de-register when the plugin is removed). The ingest-key revoke endpoint isn't shipped yet; the script points at the admin UI. Use `--keep-telemetry` to disconnect only the MCP side. |
 
 ## Requirements
 

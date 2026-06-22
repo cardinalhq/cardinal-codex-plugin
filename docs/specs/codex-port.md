@@ -84,32 +84,38 @@ Everywhere the Claude code emits `service.name=claude-code` /
 The OTLP scope name stays `cardinal-claude-plugin`? No — use
 `cardinal-codex-plugin`. Keep the scope `version` in sync with `plugin.json`.
 
-## 5. Hook registration: merge into `~/.codex/hooks.json`
+## 5. Hook registration: Codex auto-registers the plugin's `hooks/hooks.json`
 
-The Codex plugin-manifest validator **rejects** a `hooks` field, so hooks are
-not declared in `plugin.json`. Instead, `cardinal-connect` **merges** the
-plugin's hook entries into the global `~/.codex/hooks.json` (the same mechanism
-supacode uses), tagging each managed entry, and `cardinal-disconnect` removes
-them. Source of truth is `plugins/cardinal/hooks/hooks.json` (template);
-connect rewrites the `command` paths to absolute paths to the installed hook
-scripts and merges. Format (PascalCase event keys, Claude-compatible):
+**Codex auto-registers a plugin's `hooks/hooks.json` directly** (with
+`[features] hooks = true`, on by default in 0.141.0). It tracks each entry in
+`~/.codex/config.toml` under
+`[hooks.state."cardinal@<marketplace>:hooks/hooks.json:<event>:<i>:<j>"]`. So
+the plugin does **not** declare hooks in `plugin.json` (the manifest validator
+still rejects a `hooks` field) and `cardinal-connect` does **not** merge them
+into `~/.codex/hooks.json` — doing so would fire every event twice (once from
+the auto-registration, once from the global file).
+
+Source of truth is `plugins/cardinal/hooks/hooks.json`, shipped as-is. Codex
+runs each `command` through a shell from the plugin root, so the commands are
+written relative to that root — matching the official figma plugin's
+`./scripts/...` convention:
 
 ```json
 { "hooks": {
-  "SessionStart":     [ { "hooks": [ {"type":"command","command":"<abs>/initiative-convention.py","timeout":5},
-                                     {"type":"command","command":"<abs>/plan-state.py","timeout":10} ] } ],
-  "UserPromptSubmit": [ { "hooks": [ {"type":"command","command":"<abs>/git-state.py","timeout":10},
-                                     {"type":"command","command":"<abs>/limits-gate.py","timeout":5} ] } ],
-  "PostToolUse":      [ { "matcher":"spawn_agent", "hooks": [ {"type":"command","command":"<abs>/subagent-usage.py","timeout":10} ] } ],
-  "Stop":             [ { "hooks": [ {"type":"command","command":"<abs>/turn-usage.py","timeout":10},
-                                     {"type":"command","command":"<abs>/plan-usage.py","timeout":10} ] } ]
+  "SessionStart":     [ { "hooks": [ {"type":"command","command":"./hooks/initiative-convention.py","timeout":5},
+                                     {"type":"command","command":"./hooks/plan-state.py","timeout":10} ] } ],
+  "UserPromptSubmit": [ { "hooks": [ {"type":"command","command":"./hooks/git-state.py","timeout":10},
+                                     {"type":"command","command":"./hooks/limits-gate.py","timeout":5} ] } ],
+  "PostToolUse":      [ { "matcher":"spawn_agent", "hooks": [ {"type":"command","command":"./hooks/subagent-usage.py","timeout":10} ] } ],
+  "Stop":             [ { "hooks": [ {"type":"command","command":"./hooks/turn-usage.py","timeout":10},
+                                     {"type":"command","command":"./hooks/plan-usage.py","timeout":10} ] } ]
 } }
 ```
 
-Merge rules: preserve unrelated (e.g. supacode) entries; tag cardinal entries
-so disconnect can strip exactly them (append `# cardinal-managed-hook` is not
-possible in JSON — instead track managed commands by their absolute path prefix
-= the plugin root, and remove any hook whose `command` starts with that root).
+A bare script name (`git-state.py`) fails with exit 127 — the shell does a PATH
+lookup and the plugin's hooks dir is not on PATH. The `./hooks/` prefix makes it
+a path. `cardinal-disconnect` does not strip these (Codex de-registers them when
+the plugin is removed); `cardinal-status` reports the count from `[hooks.state]`.
 
 > **PostToolUse matcher** — Claude matched `Agent|Task`; Codex's subagent tool
 > is `spawn_agent`. The token-accounting fields in Codex's `tool_response`

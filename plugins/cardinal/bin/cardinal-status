@@ -3,9 +3,9 @@
 
 Reads the (full-key) state at ~/.codex/cardinal.json and reports both
 sides depending on the recorded mode. Cross-checks ~/.codex/config.toml
-(the [otel] block + [mcp_servers.cardinal] entry) and ~/.codex/hooks.json
-(cardinal-managed hook commands), then probes both endpoints for
-reachability.
+(the [otel] block + [mcp_servers.cardinal] entry, plus the [hooks.state]
+entries Codex records when it auto-registers the plugin's hooks), then
+probes both endpoints for reachability.
 
 Unlike the Claude version, the ingest key lives in cardinal.json itself
 (Codex has no settings.json env block). New Cardinal MCP registrations
@@ -14,6 +14,7 @@ legacy registrations may still point Codex at CARDINAL_MCP_API_KEY.
 """
 
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -24,7 +25,6 @@ from pathlib import Path
 CODEX_DIR = Path.home() / ".codex"
 CONFIG_PATH = CODEX_DIR / "config.toml"
 STATE_PATH = CODEX_DIR / "cardinal.json"
-HOOKS_PATH = CODEX_DIR / "hooks.json"
 MCP_API_HEADER = "x-cardinalhq-api-key"
 LEGACY_MCP_KEY_ENV_VAR = "CARDINAL_MCP_API_KEY"
 
@@ -105,27 +105,23 @@ def probe_mcp(mcp_url: str, key: str, header_name: str = MCP_API_HEADER) -> str:
         return f"✗ MCP network error: {e}"
 
 
+_HOOK_STATE_RE = re.compile(
+    r'^\s*\[hooks\.state\."cardinal@[^"]*:hooks/hooks\.json:[^"]*"\]\s*$'
+)
+
+
 def _cardinal_hook_count() -> int:
-    """Count cardinal-managed hook command entries in ~/.codex/hooks.json by
-    the plugin hooks-dir command-path prefix."""
-    hooks_dir_prefix = str(Path(__file__).resolve().parent.parent / "hooks")
-    data = load_or_die(HOOKS_PATH, "hooks.json")
-    hooks = data.get("hooks")
-    if not isinstance(hooks, dict):
+    """Count the plugin's auto-registered hooks. Codex discovers the plugin's
+    hooks/hooks.json on its own and tracks each entry in config.toml under
+    [hooks.state."cardinal@<marketplace>:hooks/hooks.json:..."]; connect does
+    NOT write to ~/.codex/hooks.json. We count those state headers."""
+    if not CONFIG_PATH.exists():
         return 0
-    n = 0
-    for groups in hooks.values():
-        if not isinstance(groups, list):
-            continue
-        for group in groups:
-            if not isinstance(group, dict):
-                continue
-            for entry in group.get("hooks", []):
-                if (isinstance(entry, dict)
-                        and isinstance(entry.get("command"), str)
-                        and entry["command"].startswith(hooks_dir_prefix)):
-                    n += 1
-    return n
+    try:
+        raw = CONFIG_PATH.read_text()
+    except Exception:
+        return 0
+    return sum(1 for line in raw.splitlines() if _HOOK_STATE_RE.match(line))
 
 
 def _header_value(headers: object, header_name: str) -> "str | None":
@@ -230,9 +226,10 @@ def main() -> int:
     n_hooks = _cardinal_hook_count()
     print()
     if n_hooks:
-        print(f"  Hooks:                {n_hooks} cardinal hook(s) registered in {HOOKS_PATH}")
+        print(f"  Hooks:                {n_hooks} cardinal hook(s) auto-registered by Codex")
     else:
-        print(f"  ✗ No cardinal hooks registered in {HOOKS_PATH}. Run /cardinal:connect --rotate.")
+        print("  ⚠ Codex hasn't auto-registered the plugin hooks "
+              "(start a new thread; ensure the plugin is enabled and features.hooks is on).")
 
     # ---- Spend limits ----------------------------------------------------
     limits_state = state.get("limits")
@@ -276,8 +273,8 @@ def main() -> int:
 
     print()
     print("If you haven't started a new Codex thread since connecting, do it now —")
-    print("config.toml ([otel] + the MCP server) and hooks.json are read when a")
-    print("thread starts.")
+    print("config.toml ([otel] + the MCP server) and the plugin's hooks are read")
+    print("when a thread starts.")
     return 0
 
 
