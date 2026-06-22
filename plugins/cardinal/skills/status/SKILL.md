@@ -19,10 +19,12 @@ key age, and probes the endpoint for reachability.
 
 ## How you (the model) should run this
 
-Invoke via the Bash tool:
+Codex does not put the plugin's `bin/` on `$PATH`, so invoke the script
+by its installed absolute path. Resolve it with the Bash tool (picks the
+highest installed version):
 
 ```
-cardinal-status
+"$(ls -d "${CODEX_HOME:-$HOME/.codex}"/plugins/cache/*/cardinal/*/bin 2>/dev/null | sort -V | tail -1)/cardinal-status"
 ```
 
 The script reads `~/.codex/cardinal.json` (the state file) and reports:

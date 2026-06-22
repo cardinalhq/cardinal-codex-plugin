@@ -32,10 +32,12 @@ blocks for up to 10 minutes waiting for the user to approve in their
 browser; the Bash tool's stdout is buffered until the call returns, so
 if you don't background it the user never sees the verification URL.
 
-Invoke via the Bash tool with `run_in_background: true`:
+Codex does not put the plugin's `bin/` on `$PATH`, so invoke the script
+by its installed absolute path. Resolve it with the Bash tool (picks the
+highest installed version) and run with `run_in_background: true`:
 
 ```
-cardinal-connect
+"$(ls -d "${CODEX_HOME:-$HOME/.codex}"/plugins/cache/*/cardinal/*/bin 2>/dev/null | sort -V | tail -1)/cardinal-connect"
 ```
 
 Then surface the URL via the pending side-channel file:
