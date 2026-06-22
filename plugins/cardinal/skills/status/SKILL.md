@@ -33,8 +33,10 @@ The script reads `~/.codex/cardinal.json` (the state file) and reports:
   in `~/.codex/config.toml` and the enrichment hooks are merged into
   `~/.codex/hooks.json`, and a reachability probe.
 - **MCP side** (when enabled): the MCP URL, key prefix, that
-  `[mcp_servers.cardinal]` is present in `~/.codex/config.toml`, and a
-  reachability probe.
+  `[mcp_servers.cardinal]` is present in `~/.codex/config.toml`, that
+  auth is available from `cardinal.json` or `http_headers`, and a
+  reachability probe. Legacy env-var registrations are reported with a
+  rotate hint.
 
 If `~/.codex/cardinal.json` doesn't exist, surfaces "not connected"
 and suggests `/cardinal:connect`. If state says connected but the

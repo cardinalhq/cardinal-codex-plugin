@@ -79,9 +79,9 @@ exits — success, denied, expired, or error.
    for the state file):
    - **`~/.codex/config.toml`** — an `[otel]` exporter block (telemetry
      side) + a `[mcp_servers.cardinal]` block (MCP side).
-   - **`~/.codex/cardinal.json`** — full ingest key + non-secret state
-     and key ids for `/cardinal:status`, `/cardinal:disconnect`, and
-     the hooks.
+   - **`~/.codex/cardinal.json`** — full ingest key, MCP key, and
+     connection metadata for `/cardinal:status`, `/cardinal:disconnect`,
+     and the hooks.
    - **`~/.codex/hooks.json`** — merges the plugin's `cardinal.*`
      enrichment hook entries; unrelated hooks are preserved.
 5. Probes both endpoints to confirm the keys actually authenticate.
@@ -106,11 +106,12 @@ exits — success, denied, expired, or error.
 `cardinal-connect` writes a `[mcp_servers.cardinal]` block into
 `~/.codex/config.toml` pointing at the org's durable aggregator URL
 (`https://<host>/api/orgs/<uuid>/mcp`), authenticated with the minted
-MCP key. Codex loads MCP servers from `config.toml` when a thread
-starts, so the `cardinal` server comes online on the next new thread —
-no per-tool re-registration. As your admin enables more integrations
-on the Cardinal side, the same URL surfaces more tools on the next
-`tools/list`; you don't need to re-run `/cardinal:connect`.
+MCP key in Codex's masked `http_headers` field. Codex loads MCP servers
+from `config.toml` when a thread starts, so the `cardinal` server comes
+online on the next new thread — no per-tool re-registration. As your
+admin enables more integrations on the Cardinal side, the same URL
+surfaces more tools on the next `tools/list`; you don't need to re-run
+`/cardinal:connect`.
 
 ## A note about `--no-tool-details`
 
