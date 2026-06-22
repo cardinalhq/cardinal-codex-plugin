@@ -3,16 +3,16 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "./hooks/initiative-convention.py", "timeout": 5 },
-          { "type": "command", "command": "./hooks/plan-state.py", "timeout": 10 }
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/initiative-convention.py\"", "timeout": 5 },
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/plan-state.py\"", "timeout": 10 }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "./hooks/git-state.py", "timeout": 10 },
-          { "type": "command", "command": "./hooks/limits-gate.py", "timeout": 5 }
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/git-state.py\"", "timeout": 10 },
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/limits-gate.py\"", "timeout": 5 }
         ]
       }
     ],
@@ -20,15 +20,15 @@
       {
         "matcher": "spawn_agent",
         "hooks": [
-          { "type": "command", "command": "./hooks/subagent-usage.py", "timeout": 10 }
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/subagent-usage.py\"", "timeout": 10 }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "./hooks/turn-usage.py", "timeout": 10 },
-          { "type": "command", "command": "./hooks/plan-usage.py", "timeout": 10 }
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/turn-usage.py\"", "timeout": 10 },
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/plan-usage.py\"", "timeout": 10 }
         ]
       }
     ]

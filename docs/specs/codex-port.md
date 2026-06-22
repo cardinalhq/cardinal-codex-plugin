@@ -96,26 +96,30 @@ into `~/.codex/hooks.json` — doing so would fire every event twice (once from
 the auto-registration, once from the global file).
 
 Source of truth is `plugins/cardinal/hooks/hooks.json`, shipped as-is. Codex
-runs each `command` through a shell from the plugin root, so the commands are
-written relative to that root — matching the official figma plugin's
-`./scripts/...` convention:
+runs each `command` through a shell, but **cwd is the project/invocation dir, NOT
+the plugin root** (empirically: `pwd` reports the dir Codex was launched from).
+A relative path therefore can't find the script. Codex *does* export the plugin
+root to the hook environment as both `CLAUDE_PLUGIN_ROOT` and `PLUGIN_ROOT`, so
+the commands resolve the script through that:
 
 ```json
 { "hooks": {
-  "SessionStart":     [ { "hooks": [ {"type":"command","command":"./hooks/initiative-convention.py","timeout":5},
-                                     {"type":"command","command":"./hooks/plan-state.py","timeout":10} ] } ],
-  "UserPromptSubmit": [ { "hooks": [ {"type":"command","command":"./hooks/git-state.py","timeout":10},
-                                     {"type":"command","command":"./hooks/limits-gate.py","timeout":5} ] } ],
-  "PostToolUse":      [ { "matcher":"spawn_agent", "hooks": [ {"type":"command","command":"./hooks/subagent-usage.py","timeout":10} ] } ],
-  "Stop":             [ { "hooks": [ {"type":"command","command":"./hooks/turn-usage.py","timeout":10},
-                                     {"type":"command","command":"./hooks/plan-usage.py","timeout":10} ] } ]
+  "SessionStart":     [ { "hooks": [ {"type":"command","command":"\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/initiative-convention.py\"","timeout":5},
+                                     {"type":"command","command":"\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/plan-state.py\"","timeout":10} ] } ],
+  "UserPromptSubmit": [ { "hooks": [ {"type":"command","command":"\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/git-state.py\"","timeout":10},
+                                     {"type":"command","command":"\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/limits-gate.py\"","timeout":5} ] } ],
+  "PostToolUse":      [ { "matcher":"spawn_agent", "hooks": [ {"type":"command","command":"\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/subagent-usage.py\"","timeout":10} ] } ],
+  "Stop":             [ { "hooks": [ {"type":"command","command":"\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/turn-usage.py\"","timeout":10},
+                                     {"type":"command","command":"\"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/plan-usage.py\"","timeout":10} ] } ]
 } }
 ```
 
-A bare script name (`git-state.py`) fails with exit 127 — the shell does a PATH
-lookup and the plugin's hooks dir is not on PATH. The `./hooks/` prefix makes it
-a path. `cardinal-disconnect` does not strip these (Codex de-registers them when
-the plugin is removed); `cardinal-status` reports the count from `[hooks.state]`.
+Things that fail: a bare name (`git-state.py`) → PATH lookup → exit 127; a
+relative path (`./hooks/git-state.py`) → resolved against the project dir, not
+the plugin → 127. The `${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}` fallback covers both
+env-var names Codex sets. `cardinal-disconnect` does not strip these (Codex
+de-registers them when the plugin is removed); `cardinal-status` reports the
+count from `[hooks.state]`.
 
 > **PostToolUse matcher** — Claude matched `Agent|Task`; Codex's subagent tool
 > is `spawn_agent`. The token-accounting fields in Codex's `tool_response`

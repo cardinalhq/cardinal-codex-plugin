@@ -806,16 +806,21 @@ class TestConnectWritesConfigToml:
 
 class TestPluginHooksTemplate:
     """Codex auto-registers the shipped hooks/hooks.json (codex-port.md §5);
-    connect no longer merges hooks. The template's commands must be runnable
-    as-is: relative to the plugin root (`./hooks/<script>.py`), pointing at
-    scripts that exist and are executable. A bare name would fail with 127."""
+    connect no longer merges hooks. Codex runs each command through a shell but
+    with cwd = the project dir (NOT the plugin root), so commands resolve the
+    script via the plugin-root env var Codex exports (CLAUDE_PLUGIN_ROOT, with
+    PLUGIN_ROOT fallback). A bare name or a relative ./hooks/ path fails 127."""
 
-    def test_commands_are_relative_to_plugin_root_and_exist(self):
+    _PREFIX = '"${CLAUDE_PLUGIN_ROOT:-$PLUGIN_ROOT}/hooks/'
+
+    def test_commands_use_plugin_root_env_and_scripts_exist(self):
         cmds = _all_hook_commands(HOOKS_DIR / "hooks.json")
         assert cmds, "template must declare hook commands"
         for c in cmds:
-            assert c.startswith("./hooks/"), f"hook command not plugin-root-relative: {c}"
-            script = PLUGIN / c[len("./"):]
+            assert c.startswith(self._PREFIX), f"hook command not plugin-root-anchored: {c}"
+            assert c.endswith('.py"'), f"hook command malformed: {c}"
+            script_name = c[len(self._PREFIX):-len('"')]
+            script = HOOKS_DIR / script_name
             assert script.exists(), f"hook script missing: {c}"
             assert os.access(script, os.X_OK), f"hook script not executable: {c}"
 
