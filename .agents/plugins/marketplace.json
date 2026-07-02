@@ -5,16 +5,16 @@
   },
   "plugins": [
     {
-      "name": "cardinal",
+      "name": "cardinal-codex-plugin",
       "source": {
         "source": "local",
-        "path": "./plugins/cardinal"
+        "path": "./plugins/cardinal-codex-plugin"
       },
       "policy": {
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"
       },
-      "category": "Developer Tools"
+      "category": "Engineering"
     }
   ]
 }
