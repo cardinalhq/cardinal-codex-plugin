@@ -1,0 +1,41 @@
+{
+  "name": "cardinal-codex-plugin",
+  "version": "0.2.0",
+  "description": "Connect Codex to Cardinal telemetry and MCP with a browser-approved device-code flow.",
+  "author": {
+    "name": "CardinalHQ",
+    "url": "https://cardinalhq.io"
+  },
+  "homepage": "https://github.com/cardinalhq/cardinal-codex-plugin",
+  "repository": "https://github.com/cardinalhq/cardinal-codex-plugin",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cardinal",
+    "mcp",
+    "observability",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Cardinal",
+    "shortDescription": "Connect Codex to Cardinal telemetry and MCP tools.",
+    "longDescription": "Cardinal connects Codex to a Cardinal workspace through a device-code flow, configures the unified Cardinal MCP endpoint, and installs local Codex hooks that emit agent-session telemetry for Cardinal Outcomes.",
+    "developerName": "CardinalHQ",
+    "category": "Engineering",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://cardinalhq.io/",
+    "privacyPolicyURL": "https://cardinalhq.io/privacy",
+    "termsOfServiceURL": "https://cardinalhq.io/terms",
+    "brandColor": "#3B82F6",
+    "defaultPrompt": [
+      "Connect Codex to Cardinal",
+      "Check my Cardinal connection",
+      "Disconnect Cardinal from Codex"
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

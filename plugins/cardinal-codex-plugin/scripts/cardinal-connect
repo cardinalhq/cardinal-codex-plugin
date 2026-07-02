@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""Connect Codex to Cardinal telemetry and MCP.
+
+Runs Cardinal's device-code flow, mints ingest and MCP keys, verifies both
+endpoints, writes a managed [mcp_servers.cardinal] block into
+~/.codex/config.toml, and installs managed Codex hooks that emit Cardinal
+agent-session telemetry.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import socket
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+PLUGIN_VERSION = "0.2.0"
+CLIENT_ID = "cardinal-codex-plugin"
+MCP_SERVER_NAME = "cardinal"
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+HOOK_SCRIPT = PLUGIN_ROOT / "hooks" / "cardinal-codex-telemetry.py"
+
+CODEX_DIR = Path.home() / ".codex"
+CONFIG_PATH = CODEX_DIR / "config.toml"
+HOOKS_PATH = CODEX_DIR / "hooks.json"
+STATE_PATH = CODEX_DIR / "cardinal.json"
+SECRETS_PATH = CODEX_DIR / "cardinal-secrets.json"
+PENDING_PATH = CODEX_DIR / "cardinal-pending.json"
+
+BEGIN_MARKER = "# BEGIN cardinal-codex-plugin managed MCP server"
+END_MARKER = "# END cardinal-codex-plugin managed MCP server"
+
+DEFAULT_POLL_TIMEOUT_SECS = 600
+DEFAULT_POLL_INTERVAL_SECS = 5
+_INGEST_PROBE_RETRY_SLEEPS = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+
+UNMANAGED_CARDINAL_TABLE_RE = re.compile(
+    r'(?m)^\s*\[mcp_servers\.(?:"cardinal"|cardinal)\]\s*$'
+)
+
+
+def toml_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def atomic_write(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.replace(path)
+
+
+def atomic_write_secret(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def backup(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    target = path.with_suffix(f"{path.suffix}.bak.{ts}")
+    target.write_text(path.read_text())
+    return target
+
+
+def derive_deployment_env(host: str) -> str:
+    try:
+        hostname = urllib.parse.urlparse(host).hostname or ""
+    except Exception:
+        return "unknown"
+    if hostname == "app.cardinalhq.io":
+        return "prod"
+    if "dogfood" in hostname:
+        return "dogfood"
+    if "cardinalhq.io" in hostname:
+        return "cardinal"
+    return "customer"
+
+
+def _post_json(url: str, body: dict, timeout: int = 15) -> tuple[int, dict | None]:
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={"content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            return resp.status, json.loads(raw) if raw else None
+    except urllib.error.HTTPError as exc:
+        raw = exc.read() if hasattr(exc, "read") else b""
+        try:
+            return exc.code, json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            return exc.code, None
+
+
+def start_device_code(host: str, scopes: list[str]) -> dict:
+    status, body = _post_json(
+        host.rstrip("/") + "/api/auth/device/code",
+        {
+            "client": CLIENT_ID,
+            "scopes": scopes,
+            "hostname": socket.gethostname(),
+        },
+    )
+    if status != 201 or not body:
+        err = (body or {}).get("error", f"HTTP {status}")
+        desc = (body or {}).get("error_description", "")
+        sys.exit(f"device-code init failed: {err}{(': ' + desc) if desc else ''}")
+    return body
+
+
+def poll_device_token(host: str, device_code: str, interval: int, timeout: int) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, body = _post_json(
+            host.rstrip("/") + "/api/auth/device/token",
+            {"device_code": device_code, "client": CLIENT_ID},
+            timeout=20,
+        )
+        body = body or {}
+        if status == 200:
+            return body
+        err = body.get("error", f"http_{status}")
+        if err == "authorization_pending":
+            time.sleep(interval)
+            continue
+        if err == "slow_down":
+            interval += 5
+            time.sleep(interval)
+            continue
+        if err == "access_denied":
+            sys.exit("Request was denied in the browser.")
+        if err == "expired_token":
+            sys.exit("Consent request expired before approval. Re-run cardinal-connect.")
+        desc = body.get("error_description", "")
+        sys.exit(f"device-code failed: {err}{(': ' + desc) if desc else ''}")
+    sys.exit("Timed out waiting for browser approval. Re-run cardinal-connect.")
+
+
+def write_pending(grant: dict) -> None:
+    payload = {
+        "verification_uri": grant.get("verification_uri", ""),
+        "user_code": grant.get("user_code", ""),
+        "expires_in": grant.get("expires_in", DEFAULT_POLL_TIMEOUT_SECS),
+        "written_at": datetime.now(timezone.utc).isoformat(),
+        "plugin_version": PLUGIN_VERSION,
+    }
+    PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(PENDING_PATH, json.dumps(payload, indent=2) + "\n")
+
+
+def clear_pending() -> None:
+    try:
+        PENDING_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def verify_mcp_reachable(mcp_url: str | None, api_key: str | None) -> tuple[bool, str]:
+    if not mcp_url:
+        return False, "server returned no MCP URL"
+    if not api_key:
+        return False, "server returned no MCP API key"
+
+    req = urllib.request.Request(
+        mcp_url,
+        method="GET",
+        headers={"x-cardinalhq-api-key": api_key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status not in (401, 403), f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return False, f"HTTP {exc.code} - MCP key invalid"
+        return True, f"HTTP {exc.code} - auth OK"
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return False, f"network error: {exc}"
+
+
+def _ingest_probe_once(endpoint: str, api_key: str, api_header: str) -> tuple[bool, str]:
+    url = endpoint.rstrip("/") + "/v1/metrics"
+    req = urllib.request.Request(
+        url,
+        data=b"",
+        method="POST",
+        headers={
+            "content-type": "application/x-protobuf",
+            api_header: api_key,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status not in (401, 403), f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return False, f"HTTP {exc.code} - ingest key invalid"
+        if exc.code < 500:
+            return True, f"HTTP {exc.code} on empty body - auth OK"
+        return False, f"HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return False, f"network error: {exc}"
+
+
+def verify_ingest_reachable(ingest: dict | None) -> tuple[bool, str]:
+    if not ingest:
+        return False, "server returned no ingest credential"
+    endpoint = ingest.get("endpoint")
+    api_key = ingest.get("api_key")
+    api_header = ingest.get("api_header") or "x-cardinalhq-api-key"
+    if not endpoint:
+        return False, "server returned no ingest endpoint"
+    if not api_key:
+        return False, "server returned no ingest API key"
+
+    last_msg = ""
+    for attempt in range(len(_INGEST_PROBE_RETRY_SLEEPS) + 1):
+        ok, msg = _ingest_probe_once(str(endpoint), str(api_key), str(api_header))
+        if ok:
+            return True, msg
+        last_msg = msg
+        if "HTTP 401" not in msg:
+            return False, msg
+        if attempt < len(_INGEST_PROBE_RETRY_SLEEPS):
+            sleep_s = _INGEST_PROBE_RETRY_SLEEPS[attempt]
+            print(
+                f"ingest key returned 401; retrying in {sleep_s:.0f}s "
+                f"(attempt {attempt + 2}/{len(_INGEST_PROBE_RETRY_SLEEPS) + 1})..."
+            )
+            time.sleep(sleep_s)
+    total = sum(_INGEST_PROBE_RETRY_SLEEPS)
+    return False, f"{last_msg} after ~{total:.0f}s; ingest key did not propagate"
+
+
+def strip_managed_block(text: str) -> tuple[str, bool]:
+    start = text.find(BEGIN_MARKER)
+    if start == -1:
+        return text, False
+    end = text.find(END_MARKER, start)
+    if end == -1:
+        sys.exit(
+            f"{CONFIG_PATH} contains {BEGIN_MARKER!r} without {END_MARKER!r}; "
+            "fix the file before rerunning."
+        )
+    end_line = text.find("\n", end)
+    stop = len(text) if end_line == -1 else end_line + 1
+    before = text[:start].rstrip()
+    after = text[stop:].lstrip("\n")
+    if before and after:
+        return before + "\n\n" + after, True
+    if before:
+        return before + "\n", True
+    return after, True
+
+
+def build_managed_block(mcp_url: str, api_key: str) -> str:
+    return (
+        f"{BEGIN_MARKER}\n"
+        f"[mcp_servers.{MCP_SERVER_NAME}]\n"
+        f"url = {toml_string(mcp_url)}\n"
+        f'http_headers = {{ "X-CardinalHQ-API-Key" = {toml_string(api_key)} }}\n'
+        f"{END_MARKER}\n"
+    )
+
+
+def write_codex_config(mcp_url: str, api_key: str) -> Path | None:
+    text = CONFIG_PATH.read_text() if CONFIG_PATH.exists() else ""
+    text_without_managed, _ = strip_managed_block(text)
+    if UNMANAGED_CARDINAL_TABLE_RE.search(text_without_managed):
+        sys.exit(
+            f"Refusing to write because {CONFIG_PATH} already contains an unmanaged "
+            "[mcp_servers.cardinal] table. Remove or rename that table, then rerun."
+        )
+
+    block = build_managed_block(mcp_url, api_key)
+    new_text = text_without_managed.rstrip()
+    if new_text:
+        new_text += "\n\n"
+    new_text += block
+
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    backup_path = backup(CONFIG_PATH)
+    atomic_write(CONFIG_PATH, new_text)
+    return backup_path
+
+
+def load_json_object(path: Path, label: str) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        sys.exit(f"Refusing to write: {label} ({path}) is not valid JSON ({exc}).")
+    if not isinstance(data, dict):
+        sys.exit(f"Refusing to write: {label} ({path}) is not a JSON object.")
+    return data
+
+
+def managed_hook_command(event_name: str) -> str:
+    return (
+        f"python3 {shlex.quote(str(HOOK_SCRIPT))} "
+        f"--event {shlex.quote(event_name)} # cardinal-codex-plugin"
+    )
+
+
+def managed_hook_group(event_name: str, timeout: int, status_message: str | None = None) -> dict:
+    hook = {
+        "type": "command",
+        "command": managed_hook_command(event_name),
+        "timeout": timeout,
+    }
+    if status_message:
+        hook["statusMessage"] = status_message
+    return {
+        "matcher": "",
+        "hooks": [hook],
+    }
+
+
+def strip_managed_hooks(data: dict) -> dict:
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        data["hooks"] = {}
+        return data
+    for event_name, groups in list(hooks.items()):
+        if not isinstance(groups, list):
+            continue
+        kept_groups = []
+        for group in groups:
+            if not isinstance(group, dict):
+                kept_groups.append(group)
+                continue
+            handlers = group.get("hooks")
+            if not isinstance(handlers, list):
+                kept_groups.append(group)
+                continue
+            kept_handlers = [
+                h for h in handlers
+                if not (
+                    isinstance(h, dict)
+                    and "cardinal-codex-plugin" in str(h.get("command") or "")
+                )
+            ]
+            if kept_handlers:
+                new_group = dict(group)
+                new_group["hooks"] = kept_handlers
+                kept_groups.append(new_group)
+        if kept_groups:
+            hooks[event_name] = kept_groups
+        else:
+            hooks.pop(event_name, None)
+    data["hooks"] = hooks
+    return data
+
+
+def write_hooks_config() -> Path | None:
+    data = strip_managed_hooks(load_json_object(HOOKS_PATH, "hooks.json"))
+    hooks = data.setdefault("hooks", {})
+    hooks.setdefault("UserPromptSubmit", []).append(
+        managed_hook_group("UserPromptSubmit", 5, "Reporting Cardinal git context")
+    )
+    hooks.setdefault("Stop", []).append(
+        managed_hook_group("Stop", 10, "Reporting Cardinal session telemetry")
+    )
+    hooks.setdefault("SubagentStop", []).append(
+        managed_hook_group("SubagentStop", 5, "Reporting Cardinal subagent telemetry")
+    )
+    HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    backup_path = backup(HOOKS_PATH)
+    atomic_write(HOOKS_PATH, json.dumps(data, indent=2) + "\n")
+    return backup_path
+
+
+def write_secrets(bundle: dict) -> None:
+    ingest = bundle.get("ingest") or {}
+    mcp = bundle.get("mcp") or {}
+    payload = {
+        "schema_version": 1,
+        "ingest_api_key": ingest.get("api_key"),
+        "ingest_api_header": ingest.get("api_header") or "x-cardinalhq-api-key",
+        "mcp_api_key": mcp.get("api_key"),
+        "written_at": datetime.now(timezone.utc).isoformat(),
+    }
+    atomic_write_secret(SECRETS_PATH, json.dumps(payload, indent=2) + "\n")
+
+
+def write_state(bundle: dict, host: str, deployment_env: str, telemetry_only: bool) -> None:
+    org = bundle.get("org", {})
+    user = bundle.get("user", {})
+    mcp = bundle.get("mcp") or {}
+    ingest = bundle.get("ingest") or {}
+    mode = (
+        "telemetry-only" if telemetry_only or not mcp
+        else "mcp-only" if not ingest
+        else "telemetry-and-mcp"
+    )
+    state = {
+        "schema_version": 2,
+        "host": host,
+        "mode": mode,
+        "org_id": org.get("id"),
+        "org_slug": org.get("slug"),
+        "user_email": user.get("email"),
+        "deployment_environment": deployment_env,
+        "plugin_version": PLUGIN_VERSION,
+        "written_at": datetime.now(timezone.utc).isoformat(),
+        "config_path": str(CONFIG_PATH),
+        "hooks_path": str(HOOKS_PATH),
+        "secrets_path": str(SECRETS_PATH),
+        "telemetry": {
+            "enabled": bool(ingest),
+        },
+    }
+    if ingest:
+        state["ingest_endpoint"] = ingest.get("endpoint")
+        state["ingest_key_id"] = ingest.get("key_id")
+        state["ingest_key_prefix"] = (ingest.get("api_key") or "")[:8]
+    if mcp:
+        state["mcp_url"] = mcp.get("url")
+        state["mcp_key_id"] = mcp.get("key_id")
+        state["mcp_key_prefix"] = mcp.get("key_prefix") or (mcp.get("api_key") or "")[:8]
+        state["mcp_created_at"] = mcp.get("created_at")
+    limits = bundle.get("limits")
+    if isinstance(limits, dict) and limits.get("status_url"):
+        state["limits"] = {
+            "status_url": limits["status_url"],
+            "enabled": bool(limits.get("enabled", True)),
+        }
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
+
+
+def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
+    expires_in = int(grant.get("expires_in") or DEFAULT_POLL_TIMEOUT_SECS)
+    interval = int(grant.get("interval") or DEFAULT_POLL_INTERVAL_SECS)
+    verification_uri = grant.get("verification_uri") or ""
+
+    print()
+    print("Open this URL in your browser to approve Cardinal for Codex:")
+    print(f"  {verification_uri}")
+    print()
+    print(f"Waiting up to {expires_in // 60} minute(s) for browser approval...")
+
+    bundle = poll_device_token(args.host, grant["device_code"], interval, expires_in)
+    org = bundle.get("org", {})
+    user = bundle.get("user", {})
+    ingest = bundle.get("ingest")
+    mcp = bundle.get("mcp")
+
+    if not ingest:
+        sys.exit("Cardinal did not return an ingest credential. Check the requested scopes.")
+    if not args.telemetry_only and not mcp:
+        sys.exit("Cardinal did not return an MCP credential. Check the requested scopes.")
+
+    deployment_env = args.deployment_env or derive_deployment_env(args.host)
+
+    if args.dry_run:
+        print(json.dumps(
+            {
+                "org": org,
+                "user": user,
+                "deployment_env": deployment_env,
+                "would_write": {
+                    "codex_config": str(CONFIG_PATH) if mcp else None,
+                    "codex_hooks": str(HOOKS_PATH),
+                    "state": str(STATE_PATH),
+                    "secrets": str(SECRETS_PATH),
+                    "ingest_endpoint": ingest.get("endpoint"),
+                    "mcp_url": (mcp or {}).get("url"),
+                },
+            },
+            indent=2,
+        ))
+        return 0
+
+    ok, msg = verify_ingest_reachable(ingest)
+    if not ok:
+        sys.exit(f"Ingest reachability failed: {msg}")
+    print(f"Ingest endpoint reachable ({msg})")
+
+    if mcp:
+        ok, msg = verify_mcp_reachable(mcp.get("url"), mcp.get("api_key"))
+        if not ok:
+            sys.exit(f"MCP reachability failed: {msg}")
+        print(f"MCP endpoint reachable ({msg})")
+
+    if not HOOK_SCRIPT.exists():
+        sys.exit(f"Telemetry hook script is missing: {HOOK_SCRIPT}")
+
+    if mcp:
+        backup_path = write_codex_config(mcp["url"], mcp["api_key"])
+        print(f"Wrote Cardinal MCP config to {CONFIG_PATH}")
+        if backup_path:
+            print(f"Config backup: {backup_path}")
+
+    write_secrets(bundle)
+    print(f"Wrote Cardinal local secrets to {SECRETS_PATH}")
+
+    hooks_backup = write_hooks_config()
+    print(f"Wrote Cardinal hooks to {HOOKS_PATH}")
+    if hooks_backup:
+        print(f"Hooks backup: {hooks_backup}")
+
+    write_state(bundle, args.host, deployment_env, args.telemetry_only)
+    print(f"Wrote Cardinal state to {STATE_PATH}")
+
+    print()
+    print(f"Connected as {user.get('email') or 'unknown'} ({org.get('slug') or org.get('id')})")
+    print(f"Telemetry endpoint: {ingest['endpoint']}")
+    if mcp:
+        print(f"MCP endpoint: {mcp['url']}")
+    print()
+    print("Restart Codex so it reloads MCP and hook config, then run cardinal-status.")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="cardinal-connect",
+        description="Connect Codex to Cardinal's unified MCP endpoint.",
+    )
+    parser.add_argument(
+        "--host",
+        default="https://app.cardinalhq.io",
+        help="Cardinal app host (default: https://app.cardinalhq.io)",
+    )
+    parser.add_argument(
+        "--rotate",
+        action="store_true",
+        help="Proceed even if Cardinal state already exists and mint a fresh key.",
+    )
+    parser.add_argument(
+        "--telemetry-only",
+        action="store_true",
+        help="Only configure Cardinal telemetry hooks; skip the MCP credential.",
+    )
+    parser.add_argument(
+        "--deployment-env",
+        default=None,
+        help="Override deployment.environment (default derived from --host).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run the device-code flow and print what would be written.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    if STATE_PATH.exists() and not args.rotate:
+        try:
+            prior = json.loads(STATE_PATH.read_text())
+        except Exception:
+            prior = {}
+        user = prior.get("user_email") or "this account"
+        sys.stderr.write(
+            f"Cardinal is already connected as {user}. "
+            "Re-run with --rotate to overwrite.\n"
+        )
+        return 2
+
+    scopes = ["ingest:write"]
+    if not args.telemetry_only:
+        scopes.append("mcp:invoke")
+    print(f"Requesting Cardinal consent for scopes: {', '.join(scopes)}")
+    grant = start_device_code(args.host, scopes)
+    write_pending(grant)
+    try:
+        return continue_after_grant(args, grant)
+    finally:
+        clear_pending()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
