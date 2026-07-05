@@ -426,6 +426,20 @@ class TelemetryHookTests(unittest.TestCase):
         self.assertIn("cardinal.turn_usage", names)
         self.assertIn("cardinal.plan_usage", names)
 
+        # api_request must carry cost_usd — codex has no native cost
+        # emitter, so the plugin computes it from usage + a model price
+        # table. Missing cost_usd is what strands codex sessions at $0 in
+        # the Outcomes Dashboard's spend-headed views.
+        api_req = next(
+            r for r in records
+            if next(a["value"]["stringValue"] for a in r["attributes"] if a["key"] == "event_name") == "api_request"
+        )
+        cost_kv = next(a for a in api_req["attributes"] if a["key"] == "cost_usd")
+        # gpt-5.5 falls back to gpt-5 pricing via longest-prefix match:
+        #   (12-7) input * $1.25/M + 7 cached * $0.125/M + 5 output * $10/M
+        #   = 6.25 + 0.875 + 50.0 nano-USD → 0.000057 rounded to 6 places.
+        self.assertAlmostEqual(cost_kv["value"]["doubleValue"], 0.000057, places=6)
+
         resource_attrs = {
             a["key"]: next(iter(a["value"].values()))
             for a in self.stub.log_batches[0]["resourceLogs"][0]["resource"]["attributes"]

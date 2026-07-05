@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.3.0"
 CLIENT_ID = "cardinal-codex-plugin"
 MCP_SERVER_NAME = "cardinal"
 

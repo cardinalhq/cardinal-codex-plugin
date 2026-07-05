@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.3.0"
 HOOK_TIMEOUT_SEC = 2.0
 MAX_EVENTS_PER_STOP = 512
 
@@ -64,6 +64,57 @@ PREFIX_TO_TYPE = {
     "research": "research",
     "spike": "research",
 }
+
+# USD per 1M tokens, per OpenAI's public pricing. Codex does not emit a
+# cost — Claude Code does, so upstream (lakerunner) reads cost_usd off the
+# api_request attributes verbatim. Without a plugin-side computation every
+# codex session lands at $0 and disappears from the Outcomes Dashboard's
+# spend-headed views. Keep this table in sync with OpenAI's pricing page;
+# lookup is exact-match first, then longest-prefix (so dated SKUs like
+# `gpt-5-codex-2026-03-01` still price correctly).
+MODEL_PRICING_USD_PER_M: dict[str, dict[str, float]] = {
+    "gpt-5":         {"input": 1.25, "cached_input": 0.125, "output": 10.00},
+    "gpt-5-codex":   {"input": 1.25, "cached_input": 0.125, "output": 10.00},
+    "gpt-5-mini":    {"input": 0.25, "cached_input": 0.025, "output":  2.00},
+    "gpt-5-nano":    {"input": 0.05, "cached_input": 0.005, "output":  0.40},
+    "o3":            {"input": 2.00, "cached_input": 0.500, "output":  8.00},
+    "o3-mini":       {"input": 1.10, "cached_input": 0.550, "output":  4.40},
+    "o4-mini":       {"input": 1.10, "cached_input": 0.275, "output":  4.40},
+}
+
+
+def price_for_model(model: str | None) -> dict[str, float] | None:
+    if not model:
+        return None
+    if model in MODEL_PRICING_USD_PER_M:
+        return MODEL_PRICING_USD_PER_M[model]
+    # Longest-prefix fallback for dated / suffixed SKUs.
+    match = ""
+    for key in MODEL_PRICING_USD_PER_M:
+        if model.startswith(key) and len(key) > len(match):
+            match = key
+    return MODEL_PRICING_USD_PER_M.get(match) if match else None
+
+
+def compute_cost_usd(model: str | None, usage: dict[str, Any]) -> float | None:
+    """Return the USD cost for one Codex api_request or None if the model
+    isn't priced. Follows OpenAI billing semantics: `input_tokens` is the
+    total input count and `cached_input_tokens` is a subset that bills at
+    the cached rate. Returning None (vs 0.0) skips the attribute so
+    unpriced models don't accumulate misleading zero rows in lakerunner."""
+    price = price_for_model(model)
+    if price is None:
+        return None
+    input_total = int(usage.get("input_tokens") or 0)
+    cached = int(usage.get("cached_input_tokens") or 0)
+    output = int(usage.get("output_tokens") or 0)
+    non_cached_input = max(0, input_total - cached)
+    cost = (
+        non_cached_input * price["input"]
+        + cached          * price["cached_input"]
+        + output          * price["output"]
+    ) / 1_000_000.0
+    return round(cost, 6)
 
 
 def silent_exit() -> None:
@@ -374,6 +425,9 @@ def append_token_events(
         "model": model,
         **usage_attrs(usage),
     }
+    cost_usd = compute_cost_usd(model, usage)
+    if cost_usd is not None:
+        base["cost_usd"] = cost_usd
     records.append(log_record("api_request", base, ts_ns))
     records.append(log_record("cardinal.turn_usage", {
         **base,
