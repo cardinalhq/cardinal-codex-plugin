@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import tomllib
@@ -82,25 +83,48 @@ def read_secrets() -> dict:
     return load_json(SECRETS_PATH) if SECRETS_PATH.exists() else {}
 
 
+_ANY_TABLE_HEADER_RE = re.compile(r"^\s*\[")
+_CARDINAL_TABLE_HEADER_RE = re.compile(
+    r'^\s*\[mcp_servers\.(?:"cardinal"|cardinal)(?:\]|\.)'
+)
+
+
 def strip_managed_block(text: str) -> tuple[str, bool]:
-    start = text.find(BEGIN_MARKER)
-    if start == -1:
+    """Remove the plugin-managed Cardinal MCP config from config.toml.
+
+    The BEGIN/END markers are ADVISORY, not a deletion span: Codex rewrites
+    config.toml itself and can move its own sections (e.g. [desktop],
+    [hooks.state]) inside the marker span (issue #10). Removal is therefore
+    parse-aware — only the marker comment lines and the
+    [mcp_servers.cardinal] table (header through the line before the next
+    table header), wherever they sit, are removed. Foreign content that
+    drifted between the markers is preserved verbatim.
+
+    The BEGIN marker still gates the whole operation: without it the file
+    is considered unmanaged and returned untouched, so a hand-written
+    [mcp_servers.cardinal] table is never deleted.
+
+    Keep this function in lockstep with cardinal-connect.
+    """
+    if BEGIN_MARKER not in text:
         return text, False
-    end = text.find(END_MARKER, start)
-    if end == -1:
-        sys.exit(
-            f"{CONFIG_PATH} contains {BEGIN_MARKER!r} without {END_MARKER!r}; "
-            "fix the file before rerunning."
-        )
-    end_line = text.find("\n", end)
-    stop = len(text) if end_line == -1 else end_line + 1
-    before = text[:start].rstrip()
-    after = text[stop:].lstrip("\n")
-    if before and after:
-        return before + "\n\n" + after, True
-    if before:
-        return before + "\n", True
-    return after, True
+    out: list[str] = []
+    in_cardinal = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith(BEGIN_MARKER) or stripped.startswith(END_MARKER):
+            continue
+        if in_cardinal:
+            if _ANY_TABLE_HEADER_RE.match(line):
+                in_cardinal = False  # table ended; fall through for this line
+            else:
+                continue
+        if _CARDINAL_TABLE_HEADER_RE.match(line):
+            in_cardinal = True
+            continue
+        out.append(line)
+    new_text = re.sub(r"\n{3,}", "\n\n", "".join(out)).strip("\n")
+    return (new_text + "\n" if new_text else ""), True
 
 
 def remove_config_block() -> bool:
