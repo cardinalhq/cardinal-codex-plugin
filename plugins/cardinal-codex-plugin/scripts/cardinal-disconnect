@@ -18,6 +18,9 @@ CONFIG_PATH = CODEX_DIR / "config.toml"
 HOOKS_PATH = CODEX_DIR / "hooks.json"
 STATE_PATH = CODEX_DIR / "cardinal.json"
 SECRETS_PATH = CODEX_DIR / "cardinal-secrets.json"
+# Plugin-owned runtime state: telemetry progress cursors, the plan stamp,
+# and spend-limits verdict/ack/override files.
+RUNTIME_DIR = CODEX_DIR / "cardinal"
 MCP_SERVER_NAME = "cardinal"
 
 BEGIN_MARKER = "# BEGIN cardinal-codex-plugin managed MCP server"
@@ -237,6 +240,12 @@ def main() -> int:
     if STATE_PATH.exists():
         STATE_PATH.unlink()
         print(f"Removed {STATE_PATH}")
+
+    if RUNTIME_DIR.exists():
+        import shutil
+
+        shutil.rmtree(RUNTIME_DIR, ignore_errors=True)
+        print(f"Removed {RUNTIME_DIR}")
 
     print()
     print("Restart Codex so it reloads MCP and hook configuration.")
