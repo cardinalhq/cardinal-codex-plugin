@@ -108,9 +108,23 @@ the contract, its fixture diff is the prompt to mirror the other.
 
 ## Live verification checklist (post-implementation)
 
-- [ ] `cardinal-connect --rotate` writes SessionStart into `~/.codex/hooks.json`.
-- [ ] New Codex session in a git repo shows the convention prompt (and budget
-      standing when limits configured).
-- [ ] A turn in a worktree-branch checkout emits the stripped initiative name.
-- [ ] plan_state emitted once, plan_usage throttled, in a multi-turn session.
-- [ ] Block verdict file → next prompt is blocked; override file downgrades.
+Verified 2026-07-06 against a real Codex session
+(`019f3819-d79b-7ae1-9e2c-67f67831b2c0`, codex-cli 0.142.5) with events
+confirmed in the prod `agent_sessions` / `agent_session_events` tables:
+
+- [x] SessionStart entry in `~/.codex/hooks.json` (connect covered by tests;
+      live install registered in the managed format).
+- [x] SessionStart handler emits the convention prompt + real budget standing
+      (`session: $0.00 of $100.00 — set by you`) and warm-writes the verdict
+      file via a live maestro fetch. **Caveat:** `codex exec` does not fire
+      SessionStart at all (interactive sessions expected to; unconfirmed) —
+      exec-mode sessions get the convention only via downstream branch
+      classification, which still works.
+- [x] Worktree stripping in prod: branch
+      `feat/worktree-fix-123-codex-parity-verify` → `initiative_name
+      codex-parity-verify`, type `feature`; `plan_type=team` /
+      `rate_limit_tier=codex` stamped on the session row.
+- [x] Throttling in prod: 1 `plan_state` + 1 `plan_usage` across a
+      multi-turn session (2 `api_request`/`turn_usage`, 3 `git_state`).
+- [x] Block verdict → `hook: UserPromptSubmit Blocked`, turn never reached
+      the model; override file downgraded the block and the turn completed.
