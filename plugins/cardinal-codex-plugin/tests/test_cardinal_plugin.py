@@ -302,6 +302,53 @@ class ConnectTests(unittest.TestCase):
         self.assertIn("unmanaged", (result.stderr + result.stdout).lower())
         self.assertFalse(self.state.exists())
 
+    def inject_drift_into_managed_block(self):
+        """Simulate the issue-#10 drift observed on a live install: Codex
+        rewrites config.toml and lands its own sections INSIDE the plugin's
+        BEGIN/END marker span."""
+        foreign = (
+            "[desktop]\n"
+            'followUpQueueMode = "queue"\n'
+            "\n"
+            "[hooks.state]\n"
+            'trusted_hash = "sha256:abc"\n'
+        )
+        end_marker = "# END cardinal-codex-plugin managed MCP server"
+        text = self.config.read_text()
+        self.assertIn(end_marker, text)
+        self.config.write_text(text.replace(end_marker, foreign + end_marker))
+
+    def test_rotate_preserves_foreign_sections_inside_managed_block(self):
+        first = run_script(CONNECT, ["--host", self.stub.url()], self.home)
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        self.inject_drift_into_managed_block()
+
+        self.stub.token_calls = 0
+        result = run_script(CONNECT, ["--host", self.stub.url(), "--rotate"], self.home)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        text = self.config.read_text()
+        self.assertEqual(text.count("[mcp_servers.cardinal]"), 1)
+        config = read_toml(self.config)
+        self.assertIn("cardinal", config["mcp_servers"])
+        self.assertEqual(config["desktop"]["followUpQueueMode"], "queue")
+        self.assertEqual(config["hooks"]["state"]["trusted_hash"], "sha256:abc")
+
+    def test_disconnect_preserves_foreign_sections_inside_managed_block(self):
+        first = run_script(CONNECT, ["--host", self.stub.url()], self.home)
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        self.inject_drift_into_managed_block()
+
+        result = run_script(DISCONNECT, [], self.home)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        text = self.config.read_text()
+        self.assertNotIn("[mcp_servers.cardinal]", text)
+        self.assertNotIn("cardinal-codex-plugin managed MCP server", text)
+        config = read_toml(self.config)
+        self.assertEqual(config["desktop"]["followUpQueueMode"], "queue")
+        self.assertEqual(config["hooks"]["state"]["trusted_hash"], "sha256:abc")
+
     def test_mcp_reachability_failure_aborts(self):
         self.stub.mcp_status = 401
         result = run_script(CONNECT, ["--host", self.stub.url()], self.home)
