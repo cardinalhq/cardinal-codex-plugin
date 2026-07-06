@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.4.0"
 CLIENT_ID = "cardinal-codex-plugin"
 MCP_SERVER_NAME = "cardinal"
 
@@ -383,6 +383,9 @@ def strip_managed_hooks(data: dict) -> dict:
 def write_hooks_config() -> Path | None:
     data = strip_managed_hooks(load_json_object(HOOKS_PATH, "hooks.json"))
     hooks = data.setdefault("hooks", {})
+    hooks.setdefault("SessionStart", []).append(
+        managed_hook_group("SessionStart", 5, "Loading Cardinal session context")
+    )
     hooks.setdefault("UserPromptSubmit", []).append(
         managed_hook_group("UserPromptSubmit", 5, "Reporting Cardinal git context")
     )

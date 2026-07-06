@@ -12,15 +12,26 @@ This is a Codex-native port of the command surface from the Claude Code plugin:
 
 ## Telemetry Scope
 
-Codex does not expose Claude Code's native OpenTelemetry emitter. This plugin emits Cardinal-compatible telemetry from Codex hooks and local Codex transcript JSONL instead. It sends the same Lakerunner event contract used by the Claude plugin where Codex exposes equivalent data:
+Codex does not expose Claude Code's native OpenTelemetry emitter. This plugin emits Cardinal-compatible telemetry from Codex hooks and local Codex transcript JSONL instead. It sends the same Lakerunner event contract used by the Claude plugin where Codex exposes equivalent data (see `docs/specs/claude-parity.md` at the repository root for the full parity map):
 
-- `api_request` token usage from Codex `token_count` transcript events.
+- `api_request` token usage (with a plugin-computed `cost_usd`) from Codex `token_count` transcript events.
 - `tool_result` plus `cardinal.turn_tool` from Codex function call/output transcript events.
-- `cardinal.git_state` from the active Git checkout on `UserPromptSubmit`.
-- `cardinal.turn_usage`, `cardinal.plan_state`, and `cardinal.plan_usage` from Codex token and rate-limit snapshots.
+- `cardinal.git_state` from the active Git checkout on `UserPromptSubmit`, including initiative classification from the branch name (worktree-noise stripped) and slash-command detection.
+- `cardinal.turn_usage` per model call (turn-relative `turn_seq`); `cardinal.plan_state` once per session and `cardinal.plan_usage` throttled to one snapshot per 10 minutes, from Codex rate-limit blocks. The last-seen `plan_type` / `rate_limit_tier` are stamped onto git_state, turn, and subagent events.
 - `cardinal.subagent_usage` when Codex hook payloads include subagent token totals.
 
 Claude subscription-specific plan fields that do not exist in Codex are left empty; Codex plan/rate-limit fields are mapped onto the existing plan usage columns where possible.
+
+## Session context & spend limits
+
+Parity features with the Claude plugin, driven by the same server-side contract:
+
+- **SessionStart context** — every session in a git repo receives the Cardinal initiative branch-naming convention as hook context, plus the session's current spend-budget standing when your Cardinal backend has agent spend limits enabled.
+- **Spend-limits gate** — on every prompt the hook reads the locally cached limits verdict (file I/O only, never network on the critical path): `notify` adds quiet agent context, `warn` also surfaces a message to you (each band surfaces once — no nagging), `block` stops the turn with the server-authored reason. Verdicts refresh in the background after each prompt's telemetry post. Everything fails open.
+
+State lives under `~/.codex/cardinal/` (telemetry progress cursors, plan stamp, limits verdicts); `cardinal-disconnect` removes it.
+
+**Upgrading from ≤0.3.x:** re-run `cardinal-connect --rotate` (or `--telemetry-only`) so the `SessionStart` hook entry is added to `~/.codex/hooks.json`.
 
 ## Install Locally
 
@@ -41,7 +52,7 @@ The skill runs `scripts/cardinal-connect`, prints a Cardinal approval URL, waits
 | File | What gets written |
 | --- | --- |
 | `~/.codex/config.toml` | A managed `[mcp_servers.cardinal]` entry with the Cardinal MCP URL and API-key header. |
-| `~/.codex/hooks.json` | Managed Cardinal hook entries for `UserPromptSubmit`, `Stop`, and `SubagentStop`. |
+| `~/.codex/hooks.json` | Managed Cardinal hook entries for `SessionStart`, `UserPromptSubmit`, `Stop`, and `SubagentStop`. |
 | `~/.codex/cardinal.json` | Non-secret state: org/user metadata, endpoint URLs, key ids, key prefixes, and config locations. |
 | `~/.codex/cardinal-secrets.json` | Local plaintext ingest/MCP keys needed by hooks and status probes; written mode `0600`. |
 

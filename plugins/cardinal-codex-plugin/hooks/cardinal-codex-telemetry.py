@@ -23,14 +23,26 @@ from pathlib import Path
 from typing import Any
 
 
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.4.0"
 HOOK_TIMEOUT_SEC = 2.0
 MAX_EVENTS_PER_STOP = 512
+
+# plan_usage cadence (mirrors the Claude plugin's 10-min Stop throttle):
+# the first snapshot of a session is unthrottled; later ones emit at most
+# every 10 minutes so heavy users produce ~7 usage events/day, not one
+# per token_count transcript event.
+PLAN_USAGE_TTL_SEC = 10 * 60
 
 CODEX_DIR = Path.home() / ".codex"
 STATE_PATH = CODEX_DIR / "cardinal.json"
 SECRETS_PATH = CODEX_DIR / "cardinal-secrets.json"
 TELEMETRY_DIR = CODEX_DIR / "cardinal" / "telemetry"
+# Last-seen plan facts (plan_type + rate_limit_tier), global across
+# sessions — the Codex analogue of the Claude plugin's plan cache. Written
+# by the Stop handler when a rate_limits block is seen; read by every
+# handler to stamp the two keys onto emitted records (parity with
+# _plan_cache.stamp_attrs()).
+PLAN_STAMP_PATH = TELEMETRY_DIR / "plan.json"
 
 TARGET_KEYS = {
     "Read": "file_path",
@@ -44,6 +56,15 @@ EXIT_CODE_RE = re.compile(r"Process exited with code (-?\d+)")
 SESSION_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "trunk"})
+
+# Noise words that appear between `worktree-` and the real name in
+# EnterWorktree-style branches. Kept in lockstep with the Claude plugin's
+# git-state.py (_strip_worktree_noise) and conductor's
+# normalizeInitiativeName.
+WORKTREE_NOISE = frozenset({
+    "fix", "feat", "bug", "bugfix", "issue", "issues", "pr",
+})
+NUMERIC_SEGMENT_RE = re.compile(r"^\d+$")
 PREFIX_TO_TYPE = {
     "feat": "feature",
     "feature": "feature",
@@ -299,6 +320,23 @@ def canonical_repo(remote_url: str | None) -> str | None:
     return f"{m.group(2)}/{name}" if m.group(2) and name else None
 
 
+def strip_worktree_noise(name: str) -> str:
+    """worktree-fix-1018-github-app-repo-picker → github-app-repo-picker.
+    Conservative: non-worktree names pass through verbatim; if nothing
+    real remains after the head, keep the original."""
+    if not name.startswith("worktree-"):
+        return name
+    segs = name.split("-")
+    i = 1
+    while i < len(segs) and (
+        segs[i] in WORKTREE_NOISE or NUMERIC_SEGMENT_RE.match(segs[i])
+    ):
+        i += 1
+    if i < len(segs):
+        return "-".join(segs[i:])
+    return name
+
+
 def resolve_initiative(branch: str | None) -> tuple[str | None, str]:
     if not branch or branch == "HEAD":
         return None, "research"
@@ -308,15 +346,121 @@ def resolve_initiative(branch: str | None) -> tuple[str | None, str]:
         prefix, _, rest = branch.partition("/")
         mapped = PREFIX_TO_TYPE.get(prefix.lower())
         if mapped and rest:
-            return rest, mapped
-    return branch, "feature"
+            return strip_worktree_noise(rest), mapped
+    return strip_worktree_noise(branch), "feature"
+
+
+COMMAND_RE = re.compile(r"^\s*/([A-Za-z0-9][\w:-]*)")
+COMMAND_TAG_RE = re.compile(r"<command-name>\s*/?([\w:-]+)\s*</command-name>")
 
 
 def detect_command(prompt: Any) -> str | None:
+    """'/code-review --fix' → 'code-review'. Accepts the raw typed form
+    (anchored at start) and the expanded <command-name> tag form, matching
+    the Claude plugin's git-state.py."""
     if not isinstance(prompt, str):
         return None
-    m = re.match(r"^\s*/([A-Za-z0-9][\w:-]*)", prompt)
-    return m.group(1) if m else None
+    m = COMMAND_RE.match(prompt)
+    if m:
+        return m.group(1)
+    m = COMMAND_TAG_RE.search(prompt)
+    if m:
+        return m.group(1)
+    return None
+
+
+def read_plan_stamp() -> dict[str, Any]:
+    """{plan_type, rate_limit_tier} from the last-seen rate_limits block,
+    or {} — callers merge it into event attrs (missing keys are skipped
+    by log_record's None/empty filter)."""
+    blob = read_json(PLAN_STAMP_PATH)
+    out: dict[str, Any] = {}
+    for key in ("plan_type", "rate_limit_tier"):
+        v = blob.get(key)
+        if isinstance(v, str) and v:
+            out[key] = v
+    return out
+
+
+def _limits():
+    """Lazy import of the sibling limits module — best-effort, None when
+    unavailable so every limits path degrades to a no-op."""
+    try:
+        import _limits_common as lc
+        return lc
+    except ImportError:
+        return None
+
+
+def limits_gate_output(session_id: str) -> dict[str, Any] | None:
+    """Port of the Claude plugin's limits-gate.py (sync half). File I/O
+    only — never touches the network. Returns the hook-output JSON to
+    print, or None (fail open).
+
+    Severity → channel mapping (the server decides severity; we route it):
+      decision=allow, band>0 → additionalContext only (model economizes).
+      decision=warn          → additionalContext + systemMessage.
+      decision=block         → {"decision": "block", reason}; an override
+                               file downgrades it to warn-tier surfacing.
+    Warn/notify obey band hysteresis (only speak when the band RISES);
+    a block is enforced every turn while in force.
+    """
+    lc = _limits()
+    if lc is None:
+        return None
+    verdict = lc.read_verdict(session_id)
+    if not verdict:
+        return None
+
+    decision = verdict.get("decision")
+    try:
+        band = int(verdict.get("band") or 0)
+    except (TypeError, ValueError):
+        band = 0
+    fetched_at = verdict.get("fetched_at")
+    age = (
+        time.time() - fetched_at
+        if isinstance(fetched_at, (int, float))
+        else float("inf")
+    )
+
+    if decision == "block" and age <= lc.BLOCK_MAX_AGE_SEC:
+        if not lc.override_path(session_id).exists():
+            reason = (
+                verdict.get("block_reason")
+                or verdict.get("user_message")
+                or "A Cardinal spend limit for this work has been reached."
+            )
+            return {"decision": "block", "reason": reason}
+        decision = "warn"  # overridden: keep the human-visible standing
+
+    if band <= 0 or age > lc.WARN_MAX_AGE_SEC:
+        return None
+
+    ack = lc._read_json_file(lc.ack_path(session_id))
+    try:
+        last_band = int(ack.get("band") or 0)
+    except (TypeError, ValueError):
+        last_band = 0
+    if band <= last_band:
+        return None
+
+    out: dict[str, Any] = {}
+    agent_context = verdict.get("agent_context")
+    if isinstance(agent_context, str) and agent_context:
+        out["hookSpecificOutput"] = {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": agent_context,
+        }
+    user_message = verdict.get("user_message")
+    if decision == "warn" and isinstance(user_message, str) and user_message:
+        out["systemMessage"] = user_message
+    if not out:
+        return None
+    lc.atomic_write_json(
+        lc.ack_path(session_id), {"band": band, "surfaced_at": time.time()}
+    )
+    return out
 
 
 def handle_user_prompt_submit(payload: dict[str, Any]) -> None:
@@ -324,24 +468,49 @@ def handle_user_prompt_submit(payload: dict[str, Any]) -> None:
     if not session_id:
         return
     cwd = str(payload.get("cwd") or os.getcwd())
+
+    # Sync gate FIRST — its stdout is the hook's verdict channel and must
+    # not wait on any network call below.
+    try:
+        gate_out = limits_gate_output(session_id)
+        if gate_out:
+            sys.stdout.write(json.dumps(gate_out))
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+    branch = None
+    repo = None
     head_sha = git(["rev-parse", "HEAD"], cwd)
-    if not head_sha:
-        return
-    branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
-    remote_url = git(["remote", "get-url", "origin"], cwd)
-    repo = canonical_repo(remote_url)
-    initiative_name, initiative_type = resolve_initiative(branch)
-    attrs: dict[str, Any] = {
-        "session_id": session_id,
-        "cardinal_cwd": cwd,
-        "cardinal_head_sha": head_sha,
-        "cardinal_branch": branch,
-        "cardinal_repo": repo,
-        "cardinal_initiative_name": initiative_name,
-        "cardinal_initiative_type": initiative_type,
-        "cardinal_command": detect_command(payload.get("prompt") or payload.get("message")),
-    }
-    emit_records([log_record("cardinal.git_state", attrs, time.time_ns())])
+    if head_sha:
+        branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+        remote_url = git(["remote", "get-url", "origin"], cwd)
+        repo = canonical_repo(remote_url)
+        initiative_name, initiative_type = resolve_initiative(branch)
+        attrs: dict[str, Any] = {
+            "session_id": session_id,
+            "cardinal_cwd": cwd,
+            "cardinal_head_sha": head_sha,
+            "cardinal_branch": branch,
+            "cardinal_repo": repo,
+            "cardinal_remote_url": remote_url,
+            "cardinal_initiative_name": initiative_name,
+            "cardinal_initiative_type": initiative_type,
+            "cardinal_command": detect_command(payload.get("prompt") or payload.get("message")),
+            **read_plan_stamp(),
+        }
+        emit_records([log_record("cardinal.git_state", attrs, time.time_ns())])
+
+    # Spend-limits verdict refresh — the async half of the gate. Runs
+    # AFTER the OTLP post and stays best-effort: limits must never cost
+    # telemetry. Refetches from maestro when the server-assigned TTL has
+    # lapsed and rewrites the verdict file the sync gate reads next turn.
+    try:
+        lc = _limits()
+        if lc is not None:
+            lc.maybe_refresh_verdict(session_id=session_id, repo=repo, branch=branch)
+    except Exception:
+        pass
 
 
 def parse_args_json(raw: Any) -> dict[str, Any]:
@@ -405,9 +574,15 @@ def append_token_events(
     session_id: str,
     payload: dict[str, Any],
     meta: dict[str, Any],
-    turn_seq: int,
+    state: dict[str, Any],
     ts_ns: int,
 ) -> None:
+    """One token_count transcript event → api_request + cardinal.turn_usage,
+    plus throttled cardinal.plan_state / cardinal.plan_usage.
+
+    `state` is the per-session mutable progress dict (persisted by the
+    caller): turn_seq, plan_state_sig, plan_usage_emitted_at, plan_stamp.
+    """
     info = payload.get("info")
     if not isinstance(info, dict):
         return
@@ -416,6 +591,24 @@ def append_token_events(
         usage = info.get("total_token_usage")
     if not isinstance(usage, dict):
         return
+
+    # Refresh the plan stamp from this event's rate_limits FIRST so the
+    # usage records emitted below carry the freshest plan facts.
+    rate_limits = payload.get("rate_limits")
+    plan_type = None
+    limit_id = None
+    if isinstance(rate_limits, dict):
+        plan_type = rate_limits.get("plan_type")
+        limit_id = rate_limits.get("limit_id")
+        stamp = {}
+        if isinstance(plan_type, str) and plan_type:
+            stamp["plan_type"] = plan_type
+        if isinstance(limit_id, str) and limit_id:
+            stamp["rate_limit_tier"] = limit_id
+        if stamp:
+            state["plan_stamp"] = stamp
+
+    plan_stamp = state.get("plan_stamp") if isinstance(state.get("plan_stamp"), dict) else {}
 
     model = meta.get("model")
     base = {
@@ -431,60 +624,92 @@ def append_token_events(
     records.append(log_record("api_request", base, ts_ns))
     records.append(log_record("cardinal.turn_usage", {
         **base,
-        "turn_seq": turn_seq,
+        "ts": ts_ns,
+        "turn_seq": state["turn_seq"],
+        **plan_stamp,
     }, ts_ns + 1))
 
-    rate_limits = payload.get("rate_limits")
-    if isinstance(rate_limits, dict):
-        plan_type = rate_limits.get("plan_type")
+    if not isinstance(rate_limits, dict):
+        return
+
+    # plan_state: once per session, re-emitted only when the values change
+    # (Claude parity: one SessionStart emit; LWW downstream).
+    plan_sig = f"{plan_type or ''}|{limit_id or ''}"
+    if plan_sig != "|" and plan_sig != state.get("plan_state_sig"):
         records.append(log_record("cardinal.plan_state", {
             "session_id": session_id,
             "agent_runtime": "codex",
+            "ts": ts_ns,
             "plan_type": plan_type,
-            "rate_limit_tier": rate_limits.get("limit_id"),
+            "rate_limit_tier": limit_id,
         }, ts_ns + 2))
-        plan_usage = {
-            "session_id": session_id,
-            "agent_runtime": "codex",
-            "plan_type": plan_type,
-            "rate_limit_tier": rate_limits.get("limit_id"),
-        }
-        primary = rate_limits.get("primary")
-        if isinstance(primary, dict):
-            plan_usage["five_hour_utilization"] = primary.get("used_percent")
-            plan_usage["five_hour_resets_at"] = primary.get("resets_at")
-        secondary = rate_limits.get("secondary")
-        if isinstance(secondary, dict):
-            plan_usage["seven_day_utilization"] = secondary.get("used_percent")
-            plan_usage["seven_day_resets_at"] = secondary.get("resets_at")
+        state["plan_state_sig"] = plan_sig
+
+    # plan_usage: first snapshot of the session unthrottled (anchors the
+    # Δ math), then at most every PLAN_USAGE_TTL_SEC of wall time.
+    last_emit = state.get("plan_usage_emitted_at")
+    now_s = time.time()
+    if isinstance(last_emit, (int, float)) and now_s - last_emit < PLAN_USAGE_TTL_SEC:
+        return
+    plan_usage = {
+        "session_id": session_id,
+        "agent_runtime": "codex",
+        "ts": ts_ns,
+        "plan_type": plan_type,
+        "rate_limit_tier": limit_id,
+    }
+    any_field = False
+    primary = rate_limits.get("primary")
+    if isinstance(primary, dict):
+        plan_usage["five_hour_utilization"] = primary.get("used_percent")
+        plan_usage["five_hour_resets_at"] = primary.get("resets_at")
+        any_field = True
+    secondary = rate_limits.get("secondary")
+    if isinstance(secondary, dict):
+        plan_usage["seven_day_utilization"] = secondary.get("used_percent")
+        plan_usage["seven_day_resets_at"] = secondary.get("resets_at")
+        any_field = True
+    if any_field:
         records.append(log_record("cardinal.plan_usage", plan_usage, ts_ns + 3))
+        state["plan_usage_emitted_at"] = now_s
 
 
 def append_tool_call_event(
     records: list[dict[str, Any]],
     session_id: str,
     call: dict[str, Any],
-    turn_seq: int,
-    tool_seq: int,
+    state: dict[str, Any],
     ts_ns: int,
-) -> tuple[dict[str, Any], int]:
+) -> dict[str, Any]:
     raw_name = str(call.get("name") or "")
     args = parse_args_json(call.get("arguments"))
     tool_name, params, target = normalize_tool_name(raw_name, args)
+    if target is None:
+        # Allowlisted file-path inputs (Claude parity: TARGET_KEYS is the
+        # privacy boundary — only path-shaped inputs become `target`).
+        key = TARGET_KEYS.get(tool_name)
+        if key:
+            v = args.get(key)
+            if isinstance(v, str) and v:
+                target = v
+    plan_stamp = state.get("plan_stamp") if isinstance(state.get("plan_stamp"), dict) else {}
     attrs: dict[str, Any] = {
         "session_id": session_id,
-        "turn_seq": turn_seq,
-        "tool_seq": tool_seq,
+        "ts": ts_ns,
+        "turn_seq": state["turn_seq"],
+        "tool_seq": state["tool_seq"],
         "tool_name": tool_name,
         "target": target,
+        **plan_stamp,
     }
     records.append(log_record("cardinal.turn_tool", attrs, ts_ns))
+    state["tool_seq"] += 1
     return {
         "tool_name": tool_name,
         "tool_parameters": params,
         "tool_input": args,
         "target": target,
-    }, tool_seq + 1
+    }
 
 
 def append_tool_result_event(
@@ -517,9 +742,14 @@ def handle_stop(payload: dict[str, Any]) -> None:
 
     progress = read_json(progress_path(session_id))
     last_line = int(progress.get("last_line") or 0)
-    turn_seq = int(progress.get("turn_seq") or 0)
-    tool_seq = int(progress.get("tool_seq") or 0)
     pending = progress.get("pending_calls") if isinstance(progress.get("pending_calls"), dict) else {}
+    state: dict[str, Any] = {
+        "turn_seq": int(progress.get("turn_seq") or 0),
+        "tool_seq": int(progress.get("tool_seq") or 0),
+        "plan_state_sig": progress.get("plan_state_sig"),
+        "plan_usage_emitted_at": progress.get("plan_usage_emitted_at"),
+        "plan_stamp": progress.get("plan_stamp") if isinstance(progress.get("plan_stamp"), dict) else read_plan_stamp(),
+    }
 
     try:
         lines = transcript_path.read_text().splitlines()
@@ -527,15 +757,20 @@ def handle_stop(payload: dict[str, Any]) -> None:
         return
     if last_line > len(lines):
         last_line = 0
-        turn_seq = 0
-        tool_seq = 0
+        state["turn_seq"] = 0
+        state["tool_seq"] = 0
         pending = {}
 
     records: list[dict[str, Any]] = []
     meta: dict[str, Any] = {}
     now_ns = time.time_ns()
+    # Where the NEXT firing resumes. When the per-Stop event cap trips we
+    # record the first unprocessed line — not len(lines) — so the tail is
+    # picked up next Stop instead of being silently skipped forever.
+    resume_line = len(lines)
     for offset, line in enumerate(lines[last_line:], start=last_line):
         if len(records) >= MAX_EVENTS_PER_STOP:
+            resume_line = offset
             break
         try:
             rec = json.loads(line)
@@ -557,12 +792,15 @@ def handle_stop(payload: dict[str, Any]) -> None:
                 meta["cwd"] = body.get("cwd")
             continue
         if rtype == "event_msg" and body.get("type") == "user_message":
-            tool_seq = 0
+            # Turn boundary: both counters restart (Claude parity —
+            # turn_seq is the model-call index WITHIN the current turn).
+            state["turn_seq"] = 0
+            state["tool_seq"] = 0
             continue
         if rtype == "event_msg" and body.get("type") == "token_count":
-            append_token_events(records, session_id, body, meta, turn_seq, ts_ns)
-            turn_seq += 1
-            tool_seq = 0
+            append_token_events(records, session_id, body, meta, state, ts_ns)
+            state["turn_seq"] += 1
+            state["tool_seq"] = 0
             continue
         if rtype != "response_item":
             continue
@@ -570,9 +808,7 @@ def handle_stop(payload: dict[str, Any]) -> None:
         item_type = body.get("type")
         if item_type == "function_call":
             call_id = body.get("call_id")
-            normalized, tool_seq = append_tool_call_event(
-                records, session_id, body, turn_seq, tool_seq, ts_ns
-            )
+            normalized = append_tool_call_event(records, session_id, body, state, ts_ns)
             if isinstance(call_id, str) and call_id:
                 pending[call_id] = normalized
             continue
@@ -582,14 +818,114 @@ def handle_stop(payload: dict[str, Any]) -> None:
                 append_tool_result_event(records, session_id, pending.pop(call_id), body.get("output"), ts_ns)
 
     emit_records(records)
+    plan_stamp = state.get("plan_stamp")
+    if isinstance(plan_stamp, dict) and plan_stamp:
+        atomic_write_json(PLAN_STAMP_PATH, {
+            **plan_stamp,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
     atomic_write_json(progress_path(session_id), {
-        "last_line": len(lines),
-        "turn_seq": turn_seq,
-        "tool_seq": tool_seq,
+        "last_line": resume_line,
+        "turn_seq": state["turn_seq"],
+        "tool_seq": state["tool_seq"],
+        "plan_state_sig": state.get("plan_state_sig"),
+        "plan_usage_emitted_at": state.get("plan_usage_emitted_at"),
+        "plan_stamp": plan_stamp if isinstance(plan_stamp, dict) else None,
         "pending_calls": pending,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "transcript_path": str(transcript_path),
     })
+
+
+# The initiative-convention prompt (Claude plugin parity: initiative-
+# convention.py). Codex reads it once per session via SessionStart
+# additionalContext and acts on it when branches come up. Worded to steer
+# branch creation, not to demand renames of existing branches.
+CONVENTION_PROMPT = (
+    "You are running inside a Cardinal-instrumented Codex session. "
+    "Cardinal attributes agent spend to 'initiatives' — "
+    "one branch = one initiative. When you create a new branch for "
+    "work in this session, follow the convention:\n\n"
+    "  <type-prefix>/<kebab-name>\n\n"
+    "  type-prefix  ∈ {feat, fix, refactor, infra, chore, research, spike}\n"
+    "  kebab-name   = lowercase, 1–4 dash-separated segments\n\n"
+    "Examples:\n"
+    "  feat/outcomes-observability    → name 'outcomes-observability', type 'feature'\n"
+    "  fix/login-crash                → name 'login-crash',            type 'bugfix'\n"
+    "  refactor/auth-token-rotation   → name 'auth-token-rotation',    type 'refactor'\n"
+    "  research/data-pipeline-spike   → name 'data-pipeline-spike',    type 'research'\n\n"
+    "Prefix aliases: 'feature' = 'feat', 'bugfix' = 'fix', 'chore' = "
+    "'infra', 'spike' = 'research'. Other conventional prefixes are "
+    "also recognized: 'perf' → feature; 'cleanup' → refactor; 'test', "
+    "'tests', 'ci', 'build', 'deps', 'docs', 'doc' → infra. Sessions "
+    "on main/master/develop/"
+    "trunk are treated as research/scoping work — when intent "
+    "crystallises into a deliverable, cut a typed branch using this "
+    "convention. Off-convention branches get a stable name but "
+    "default to type 'feature', so the convention is the way to "
+    "ensure correct classification."
+)
+
+
+def _is_git_repo(cwd: str) -> bool:
+    return git(["rev-parse", "--is-inside-work-tree"], cwd) == "true"
+
+
+def _budget_standing(session_id: str | None, cwd: str) -> str | None:
+    """One synchronous limits fetch at session start (short timeout, fail
+    open) so the budget is part of the session's standing context from
+    turn one. Also warm-writes the verdict file the per-turn sync gate
+    reads. No-op when the backend doesn't advertise the limits protocol."""
+    if not session_id:
+        return None
+    lc = _limits()
+    if lc is None or not lc.limits_config():
+        return None
+    repo, branch = lc.git_facts(cwd)
+    verdict = lc.maybe_refresh_verdict(
+        session_id=session_id, repo=repo, branch=branch, force=True, timeout=1.5
+    )
+    if not verdict:
+        return None
+    lines = lc.standing_lines(verdict)
+    if not lines:
+        return None
+    parts = ["Cardinal spend budgets apply to this session:"]
+    parts.extend(lines)
+    # Server-authored copy rides through verbatim — when a threshold is
+    # already crossed at session start, lead with the server's message.
+    user_message = verdict.get("user_message")
+    if isinstance(user_message, str) and user_message:
+        parts.append(user_message)
+    parts.append(
+        "Work economically as budgets tighten; budget standing updates "
+        "arrive automatically as the session proceeds."
+    )
+    return "\n".join(parts)
+
+
+def handle_session_start(payload: dict[str, Any]) -> None:
+    cwd = str(payload.get("cwd") or os.getcwd())
+    if not _is_git_repo(cwd):
+        # Outside a git repo there's no branch to advise on; suppress the
+        # prompt to avoid wasted context.
+        return
+    context = CONVENTION_PROMPT
+    try:
+        standing = _budget_standing(session_id_from_payload(payload), cwd)
+        if standing:
+            context = f"{CONVENTION_PROMPT}\n\n{standing}"
+    except Exception:
+        # Budget standing is additive — never let it cost the convention
+        # prompt (or session start).
+        pass
+    sys.stdout.write(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": context,
+        }
+    }))
+    sys.stdout.flush()
 
 
 def handle_subagent_stop(payload: dict[str, Any]) -> None:
@@ -609,6 +945,7 @@ def handle_subagent_stop(payload: dict[str, Any]) -> None:
         "subagent_type": payload.get("subagent_type") or payload.get("subagentType") or payload.get("matcher"),
         "agent_id": payload.get("agent_id") or payload.get("agentId"),
         "total_tokens": total_tokens,
+        **read_plan_stamp(),
     }
     emit_records([log_record("cardinal.subagent_usage", attrs, time.time_ns())])
 
@@ -629,6 +966,8 @@ def main() -> None:
     try:
         if args.event == "UserPromptSubmit":
             handle_user_prompt_submit(payload)
+        elif args.event == "SessionStart":
+            handle_session_start(payload)
         elif args.event == "Stop":
             handle_stop(payload)
         elif args.event == "SubagentStop":
