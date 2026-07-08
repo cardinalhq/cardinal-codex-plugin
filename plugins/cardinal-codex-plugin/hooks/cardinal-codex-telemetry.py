@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 
-PLUGIN_VERSION = "0.4.1"
+PLUGIN_VERSION = "0.5.0"
 HOOK_TIMEOUT_SEC = 2.0
 MAX_EVENTS_PER_STOP = 512
 
@@ -43,6 +43,12 @@ TELEMETRY_DIR = CODEX_DIR / "cardinal" / "telemetry"
 # handler to stamp the two keys onto emitted records (parity with
 # _plan_cache.stamp_attrs()).
 PLAN_STAMP_PATH = TELEMETRY_DIR / "plan.json"
+# P5 capture affordance (subagent-telemetry-enrichment field 4, step 1):
+# Codex's SubagentStop payload shape has never been observed in the wild,
+# so an env-gated raw-payload dump is how we finally capture one. Off by
+# default; writes nothing unless CARDINAL_CODEX_DEBUG_PAYLOADS=1.
+DEBUG_PAYLOADS_ENV = "CARDINAL_CODEX_DEBUG_PAYLOADS"
+DEBUG_DIR = TELEMETRY_DIR / "debug"
 
 TARGET_KEYS = {
     "Read": "file_path",
@@ -382,6 +388,19 @@ def read_plan_stamp() -> dict[str, Any]:
     return out
 
 
+def dump_debug_payload(event: str, payload: dict[str, Any]) -> None:
+    """Env-gated raw hook-payload dump for shape capture. A no-op unless
+    CARDINAL_CODEX_DEBUG_PAYLOADS=1; best-effort like everything else."""
+    if os.environ.get(DEBUG_PAYLOADS_ENV) != "1":
+        return
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        path = DEBUG_DIR / f"{event}-{time.time_ns()}.json"
+        path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 def _limits():
     """Lazy import of the sibling limits module — best-effort, None when
     unavailable so every limits path degrades to a no-op."""
@@ -549,6 +568,144 @@ def extract_patch_target(patch: str) -> str | None:
     return None
 
 
+# Bash verb classification (subagent-telemetry-enrichment field 3) — a
+# closed enum derived from the command WORD only; the command string is
+# never emitted on cardinal.turn_tool, in whole or in part. Ambiguity
+# resolves toward the write-risky side (the harvester discounts write
+# work, so misclassifying read-as-write only costs savings estimate,
+# never privacy or correctness). Tables and rules are a verbatim port of
+# the Claude plugin's turn-usage.py classifier; fixture parity is the
+# lockstep guard (claude-parity.md §Keeping the repos in lockstep).
+#
+# Write-risk ordering: when a compound command spans classes, the
+# lowest-index class wins and bash_multi=true is emitted.
+BASH_CLASS_RANK = (
+    "file-write",
+    "git-write",
+    "pkg",
+    "network",
+    "build",
+    "test",
+    "git-read",
+    "file-read",
+    "other",
+)
+
+# Single-word command → class. Unknown words → "other".
+BASH_CMD_CLASS = {
+    # test
+    "pytest": "test", "tox": "test", "jest": "test", "vitest": "test",
+    "rspec": "test", "phpunit": "test",
+    # build
+    "make": "build", "cmake": "build", "tsc": "build", "gradle": "build",
+    "mvn": "build", "gcc": "build", "clang": "build", "webpack": "build",
+    # pkg
+    "pip": "pkg", "pip3": "pkg", "brew": "pkg", "gem": "pkg",
+    "apt": "pkg", "apt-get": "pkg", "yum": "pkg", "dnf": "pkg",
+    "apk": "pkg", "poetry": "pkg", "uv": "pkg",
+    # file-read
+    "ls": "file-read", "cat": "file-read", "find": "file-read",
+    "grep": "file-read", "rg": "file-read", "head": "file-read",
+    "tail": "file-read", "wc": "file-read", "du": "file-read",
+    "df": "file-read", "stat": "file-read", "file": "file-read",
+    "tree": "file-read", "which": "file-read", "pwd": "file-read",
+    "less": "file-read", "more": "file-read", "diff": "file-read",
+    "awk": "file-read", "echo": "file-read", "sort": "file-read",
+    "uniq": "file-read", "cut": "file-read", "jq": "file-read",
+    # file-write (sed classifies here: -i vs not is an argument, and
+    # arguments are never consulted — write-risky wins)
+    "rm": "file-write", "mv": "file-write", "cp": "file-write",
+    "mkdir": "file-write", "rmdir": "file-write", "chmod": "file-write",
+    "chown": "file-write", "touch": "file-write", "ln": "file-write",
+    "sed": "file-write", "tee": "file-write", "truncate": "file-write",
+    "dd": "file-write", "tar": "file-write", "unzip": "file-write",
+    "zip": "file-write",
+    # network
+    "curl": "network", "wget": "network", "gh": "network",
+    "ssh": "network", "scp": "network", "rsync": "network",
+    "nc": "network", "ping": "network", "dig": "network",
+    "host": "network", "nslookup": "network",
+}
+
+# Multiplexer commands whose class hangs on the SUBcommand word (still
+# never an argument): {cmd: (subcommand → class, default class)}.
+GIT_READ_SUBS = {
+    "status", "log", "diff", "show", "blame", "shortlog", "reflog",
+    "describe", "rev-parse", "ls-files", "ls-remote", "ls-tree",
+    "cat-file", "grep",
+}
+BASH_MULTIPLEX_CLASS = {
+    # git subcommands outside the read set default to git-write
+    # (write-risky wins for branch/tag/stash-style ambiguity).
+    "git": ({s: "git-read" for s in GIT_READ_SUBS}, "git-write"),
+    "go": (
+        {"test": "test", "vet": "test",
+         "build": "build", "run": "build", "generate": "build",
+         "get": "pkg", "install": "pkg", "mod": "pkg"},
+        "other",
+    ),
+    "cargo": (
+        {"test": "test", "bench": "test",
+         "build": "build", "check": "build", "run": "build",
+         "clippy": "build",
+         "add": "pkg", "install": "pkg", "update": "pkg",
+         "remove": "pkg"},
+        "other",
+    ),
+    "npm": (
+        {"test": "test", "run": "build", "exec": "build"},
+        "pkg",  # install/i/ci/add/uninstall/update/…
+    ),
+    "pnpm": (
+        {"test": "test", "run": "build", "exec": "build"},
+        "pkg",
+    ),
+    "yarn": (
+        {"test": "test", "run": "build"},
+        "pkg",
+    ),
+    "bun": (
+        {"test": "test", "run": "build", "build": "build"},
+        "pkg",
+    ),
+}
+
+
+def classify_bash_command(command: str) -> tuple[str, bool] | None:
+    """Map a Bash command string to (bash_class, bash_multi).
+
+    Tokenizes on shell separators (&&, ||, ;, |, newline); classifies
+    each segment by its leading command word after stripping env-var
+    prefixes and sudo; the most write-risky class present wins
+    (BASH_CLASS_RANK order). bash_multi is True when segments span more
+    than one class. Only the command/subcommand WORD feeds the lookup —
+    no argument ever does, and nothing from the string is returned
+    beyond the closed enum. Returns None when no command word is found.
+    """
+    for sep in ("&&", "||", ";", "|", "\n"):
+        command = command.replace(sep, "\x00")
+    classes: set[str] = set()
+    for segment in command.split("\x00"):
+        words = segment.split()
+        # Strip env-var prefixes (FOO=bar) and sudo from the front.
+        while words and ("=" in words[0] or words[0] == "sudo"):
+            words.pop(0)
+        if not words:
+            continue
+        cmd = words[0].rsplit("/", 1)[-1]  # /usr/bin/git → git
+        mux = BASH_MULTIPLEX_CLASS.get(cmd)
+        if mux is not None:
+            sub_map, default = mux
+            sub = words[1] if len(words) > 1 else ""
+            classes.add(sub_map.get(sub, default))
+        else:
+            classes.add(BASH_CMD_CLASS.get(cmd, "other"))
+    if not classes:
+        return None
+    winner = min(classes, key=BASH_CLASS_RANK.index)
+    return winner, len(classes) > 1
+
+
 def output_success(output: Any) -> str:
     if not isinstance(output, str):
         return "true"
@@ -625,6 +782,7 @@ def append_token_events(
     records.append(log_record("cardinal.turn_usage", {
         **base,
         "ts": ts_ns,
+        "user_turn_seq": state["user_turn_seq"],
         "turn_seq": state["turn_seq"],
         **plan_stamp,
     }, ts_ns + 1))
@@ -696,12 +854,31 @@ def append_tool_call_event(
     attrs: dict[str, Any] = {
         "session_id": session_id,
         "ts": ts_ns,
+        "user_turn_seq": state["user_turn_seq"],
         "turn_seq": state["turn_seq"],
         "tool_seq": state["tool_seq"],
         "tool_name": tool_name,
         "target": target,
         **plan_stamp,
     }
+    if tool_name == "mcp_tool":
+        # turn_tool carries the raw qualified MCP name — the harvester's
+        # strongest clustering signal — while tool_result keeps the
+        # normalized `mcp_tool` form (lakerunner's mcp_servers_used
+        # aggregation reads that; do not disturb it).
+        attrs["tool_name"] = raw_name
+        attrs["mcp_server_name"] = params.get("mcp_server_name")
+        attrs["mcp_tool_name"] = params.get("mcp_tool_name")
+    elif tool_name == "Bash":
+        # Privacy boundary: only the closed enum lands on turn_tool; the
+        # command text itself stays on tool_result's tool_input (the
+        # existing, documented divergence from the Claude plugin).
+        classified = classify_bash_command(str(params.get("full_command") or ""))
+        if classified is not None:
+            bash_class, bash_multi = classified
+            attrs["bash_class"] = bash_class
+            if bash_multi:
+                attrs["bash_multi"] = True
     records.append(log_record("cardinal.turn_tool", attrs, ts_ns))
     state["tool_seq"] += 1
     return {
@@ -744,6 +921,7 @@ def handle_stop(payload: dict[str, Any]) -> None:
     last_line = int(progress.get("last_line") or 0)
     pending = progress.get("pending_calls") if isinstance(progress.get("pending_calls"), dict) else {}
     state: dict[str, Any] = {
+        "user_turn_seq": int(progress.get("user_turn_seq") or 0),
         "turn_seq": int(progress.get("turn_seq") or 0),
         "tool_seq": int(progress.get("tool_seq") or 0),
         "plan_state_sig": progress.get("plan_state_sig"),
@@ -757,6 +935,7 @@ def handle_stop(payload: dict[str, Any]) -> None:
         return
     if last_line > len(lines):
         last_line = 0
+        state["user_turn_seq"] = 0
         state["turn_seq"] = 0
         state["tool_seq"] = 0
         pending = {}
@@ -792,8 +971,12 @@ def handle_stop(payload: dict[str, Any]) -> None:
                 meta["cwd"] = body.get("cwd")
             continue
         if rtype == "event_msg" and body.get("type") == "user_message":
-            # Turn boundary: both counters restart (Claude parity —
-            # turn_seq is the model-call index WITHIN the current turn).
+            # Turn boundary: the per-turn counters restart (Claude parity —
+            # turn_seq is the model-call index WITHIN the current turn)
+            # while the session-monotonic user-turn ordinal advances, so
+            # (user_turn_seq, turn_seq, tool_seq) totally orders the
+            # session's tool stream across Stop firings.
+            state["user_turn_seq"] += 1
             state["turn_seq"] = 0
             state["tool_seq"] = 0
             continue
@@ -826,6 +1009,7 @@ def handle_stop(payload: dict[str, Any]) -> None:
         })
     atomic_write_json(progress_path(session_id), {
         "last_line": resume_line,
+        "user_turn_seq": state["user_turn_seq"],
         "turn_seq": state["turn_seq"],
         "tool_seq": state["tool_seq"],
         "plan_state_sig": state.get("plan_state_sig"),
@@ -929,6 +1113,9 @@ def handle_session_start(payload: dict[str, Any]) -> None:
 
 
 def handle_subagent_stop(payload: dict[str, Any]) -> None:
+    # Shape capture BEFORE any early return — the whole point is to see
+    # payloads the emit path below can't handle yet (P5).
+    dump_debug_payload("SubagentStop", payload)
     session_id = session_id_from_payload(payload)
     if not session_id:
         return
