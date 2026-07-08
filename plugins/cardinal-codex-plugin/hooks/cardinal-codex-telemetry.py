@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 
-PLUGIN_VERSION = "0.5.0"
+PLUGIN_VERSION = "0.5.1"
 HOOK_TIMEOUT_SEC = 2.0
 MAX_EVENTS_PER_STOP = 512
 
@@ -1112,6 +1112,31 @@ def handle_session_start(payload: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+def subagent_description_from_payload(payload: dict[str, Any]) -> str | None:
+    """Best-effort extraction of the subagent's short task label.
+
+    Task label only — this is the approved free-text boundary widening
+    (parity with cardinal-claude-plugin v0.12.1's `subagent_description`),
+    capped at 160 chars. Codex's SubagentStop payload shape is still
+    unobserved (P5), so probe the plausible key spellings; the real key
+    names are to be confirmed from the P5 debug captures.
+    """
+    candidates: list[Any] = [
+        payload.get("description"),
+        payload.get("task_description"),
+        payload.get("taskDescription"),
+        payload.get("label"),
+    ]
+    for input_key in ("tool_input", "toolInput"):
+        tool_input = payload.get(input_key)
+        if isinstance(tool_input, dict):
+            candidates.append(tool_input.get("description"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()[:160]
+    return None
+
+
 def handle_subagent_stop(payload: dict[str, Any]) -> None:
     # Shape capture BEFORE any early return — the whole point is to see
     # payloads the emit path below can't handle yet (P5).
@@ -1131,6 +1156,7 @@ def handle_subagent_stop(payload: dict[str, Any]) -> None:
         "agent_runtime": "codex",
         "subagent_type": payload.get("subagent_type") or payload.get("subagentType") or payload.get("matcher"),
         "agent_id": payload.get("agent_id") or payload.get("agentId"),
+        "subagent_description": subagent_description_from_payload(payload),
         "total_tokens": total_tokens,
         **read_plan_stamp(),
     }

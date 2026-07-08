@@ -1067,6 +1067,47 @@ class EnrichmentHookTests(unittest.TestCase):
         self.assertEqual(len(dumps), 1)
         self.assertEqual(json.loads(dumps[0].read_text()), payload)
 
+    def _subagent_usage_for(self, payload: dict) -> dict:
+        before = len(self.stub.log_batches)
+        result = run_hook(["--event", "SubagentStop"], self.home, payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        batch = self.stub.log_batches[before]
+        (usage,) = records_named(batch, "cardinal.subagent_usage")
+        return usage
+
+    def test_subagent_description_accepted_key_spellings(self):
+        """Best-effort key probing (v0.5.1): the SubagentStop payload
+        shape is unobserved (P5), so every plausible spelling of the
+        task label must land as subagent_description."""
+        base = {"session_id": "sess-desc-1", "total_tokens": 42}
+        cases = [
+            ({"description": "Review auth flow"}, "Review auth flow"),
+            ({"task_description": "Scan for leaks"}, "Scan for leaks"),
+            ({"taskDescription": "Summarize diff"}, "Summarize diff"),
+            ({"label": "explore-repo"}, "explore-repo"),
+            ({"tool_input": {"description": "Nested snake"}}, "Nested snake"),
+            ({"toolInput": {"description": "Nested camel"}}, "Nested camel"),
+        ]
+        for extra, expected in cases:
+            with self.subTest(keys=sorted(extra)):
+                usage = self._subagent_usage_for({**base, **extra})
+                self.assertEqual(usage["subagent_description"], expected)
+
+    def test_subagent_description_absent_when_no_label(self):
+        usage = self._subagent_usage_for(
+            {"session_id": "sess-desc-2", "total_tokens": 42}
+        )
+        self.assertNotIn("subagent_description", usage)
+
+    def test_subagent_description_truncated_to_160_chars(self):
+        long_label = "x" * 400
+        usage = self._subagent_usage_for(
+            {"session_id": "sess-desc-3", "total_tokens": 42,
+             "description": long_label}
+        )
+        self.assertEqual(usage["subagent_description"], "x" * 160)
+        self.assertEqual(len(usage["subagent_description"]), 160)
+
 
 if __name__ == "__main__":
     unittest.main()
