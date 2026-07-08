@@ -24,7 +24,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-PLUGIN_VERSION = "0.5.1"
+def _load_plugin_version() -> str:
+    """Read the canonical version from the sibling plugin.json.
+
+    Same pattern as hooks/_plugin_version.py — one source of truth, no
+    hardcoded constants that drift out of sync with releases.
+    """
+    manifest = Path(__file__).resolve().parent.parent / ".codex-plugin" / "plugin.json"
+    try:
+        return json.loads(manifest.read_text(encoding="utf-8")).get("version") or "unknown"
+    except (OSError, ValueError):
+        return "unknown"
+
+
+PLUGIN_VERSION = _load_plugin_version()
 CLIENT_ID = "cardinal-codex-plugin"
 MCP_SERVER_NAME = "cardinal"
 

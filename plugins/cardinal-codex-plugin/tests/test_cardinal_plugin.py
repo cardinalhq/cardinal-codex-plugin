@@ -228,12 +228,32 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(entry["headers"]["X-CardinalHQ-API-Key"], "${CARDINAL_MCP_API_KEY}")
         self.assertFalse(entry["enabled"])
 
-    def test_plugin_version_matches_connect_constant(self):
+    def test_plugin_version_is_loaded_at_runtime(self):
+        # Both cardinal-connect and the telemetry hook now resolve
+        # PLUGIN_VERSION from plugin.json at import time — no hardcoded
+        # constants. Loading both modules and asserting equality
+        # catches (a) the manifest being missing/unreadable and
+        # (b) any regression that reintroduces a hardcoded string.
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
         manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
-        text = CONNECT.read_text()
-        match = re.search(r'PLUGIN_VERSION\s*=\s*"([^"]+)"', text)
-        self.assertIsNotNone(match)
-        self.assertEqual(manifest["version"], match.group(1))
+
+        def _load(name, path):
+            loader = SourceFileLoader(name, str(path))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+
+        connect = _load("cardinal_connect_module", CONNECT)
+        self.assertEqual(connect.PLUGIN_VERSION, manifest["version"])
+        self.assertNotEqual(connect.PLUGIN_VERSION, "unknown")
+
+        version_helper = _load(
+            "cardinal_codex_plugin_version",
+            ROOT / "hooks" / "_plugin_version.py",
+        )
+        self.assertEqual(version_helper.plugin_version(), manifest["version"])
 
 
 class ConnectTests(unittest.TestCase):

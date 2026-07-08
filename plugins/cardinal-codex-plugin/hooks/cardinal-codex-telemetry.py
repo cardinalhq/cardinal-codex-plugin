@@ -22,8 +22,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _plugin_version  # noqa: E402
 
-PLUGIN_VERSION = "0.5.1"
+
+PLUGIN_VERSION = _plugin_version.plugin_version()
 HOOK_TIMEOUT_SEC = 2.0
 MAX_EVENTS_PER_STOP = 512
 
