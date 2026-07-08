@@ -110,6 +110,22 @@ Staged approach:
    — the harvester's no-thin-signal rule excludes them; nothing is
    guessed.
 
+### Addendum (v0.5.1) — `subagent_description`
+
+`cardinal.subagent_usage` now carries a best-effort
+`subagent_description`: the subagent's short task label, mirroring
+cardinal-claude-plugin v0.12.1. Because the SubagentStop payload shape
+is still unconfirmed (P5), the hook probes plausible key spellings
+(`description`, `task_description`, `taskDescription`, `label`, and
+nested `tool_input.description` / `toolInput.description`) and emits
+the first string hit; the real key names will be confirmed from the P5
+debug captures.
+
+Privacy note: this is the first approved free-text field on the
+telemetry stream. The boundary widening is deliberately narrow — the
+task label only (never the prompt or transcript), capped at 160 chars,
+omitted entirely when absent.
+
 ## Assumed-agent catalog (open question, do not block on it)
 
 The Claude plugin ships a `brainstorm` catalog agent with a `model:`
