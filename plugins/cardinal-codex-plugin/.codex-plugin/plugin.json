@@ -1,13 +1,13 @@
 {
   "name": "cardinal-codex-plugin",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "Connect Codex to Cardinal telemetry and MCP with a browser-approved device-code flow.",
   "author": {
     "name": "CardinalHQ",
     "url": "https://cardinalhq.io"
   },
-  "homepage": "https://github.com/cardinalhq/cardinal-codex-plugin",
-  "repository": "https://github.com/cardinalhq/cardinal-codex-plugin",
+  "homepage": "https://github.com/cardinalhq/cardinal-agent-plugins",
+  "repository": "https://github.com/cardinalhq/cardinal-agent-plugins",
   "license": "Apache-2.0",
   "keywords": [
     "cardinal",
