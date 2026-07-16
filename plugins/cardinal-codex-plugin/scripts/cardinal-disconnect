@@ -22,6 +22,9 @@ SECRETS_PATH = CODEX_DIR / "cardinal-secrets.json"
 # Plugin-owned runtime state: telemetry progress cursors, the plan stamp,
 # and spend-limits verdict/ack/override files.
 RUNTIME_DIR = CODEX_DIR / "cardinal"
+# Stable, non-versioned launcher installed by cardinal-connect; kept in
+# lockstep with LAUNCHER_PATH there.
+LAUNCHER_PATH = RUNTIME_DIR / "cardinal-codex-telemetry.py"
 MCP_SERVER_NAME = "cardinal"
 
 BEGIN_MARKER = "# BEGIN cardinal-codex-plugin managed MCP server"
