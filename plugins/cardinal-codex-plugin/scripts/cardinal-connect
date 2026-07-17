@@ -52,6 +52,11 @@ HOOKS_PATH = CODEX_DIR / "hooks.json"
 STATE_PATH = CODEX_DIR / "cardinal.json"
 SECRETS_PATH = CODEX_DIR / "cardinal-secrets.json"
 PENDING_PATH = CODEX_DIR / "cardinal-pending.json"
+# Stable, non-versioned launcher path. hooks.json references THIS, not the
+# versioned plugin-cache path, so plugin upgrades don't dangle the command
+# (fix for issue: Codex removes the old <version>/ cache dir on upgrade).
+LAUNCHER_DIR = CODEX_DIR / "cardinal"
+LAUNCHER_PATH = LAUNCHER_DIR / "cardinal-codex-telemetry.py"
 
 BEGIN_MARKER = "# BEGIN cardinal-codex-plugin managed MCP server"
 END_MARKER = "# END cardinal-codex-plugin managed MCP server"
@@ -172,9 +177,94 @@ def load_json_object(path: Path, label: str) -> dict:
 
 def managed_hook_command(event_name: str) -> str:
     return (
-        f"python3 {shlex.quote(str(HOOK_SCRIPT))} "
+        f"python3 {shlex.quote(str(LAUNCHER_PATH))} "
         f"--event {shlex.quote(event_name)} # cardinal-codex-plugin"
     )
+
+
+# Stable launcher script. Codex hooks.json points here, and this shim
+# resolves the newest installed plugin version at invocation time. Written
+# atomically on every connect; overwrites cleanly on plugin upgrade.
+LAUNCHER_TEMPLATE = '''\
+#!/usr/bin/env python3
+"""cardinal-codex-plugin telemetry launcher (stable path).
+
+Installed by cardinal-connect at ~/.codex/cardinal/. hooks.json references
+THIS file, not the versioned plugin-cache path — so when Codex upgrades the
+plugin and removes the old cache dir, hooks.json still resolves.
+
+Behavior: pick the newest installed plugin version under
+~/.codex/plugins/cache/<owner>/cardinal-codex-plugin/*/hooks/ and exec its
+hook with our argv. If none is installed, fall back to FALLBACK_HOOK (the
+absolute path known at connect time — covers manual/dev installs where the
+plugin lives outside the versioned cache).
+
+Telemetry is best-effort: any failure exits 0 silently, per the same
+policy as the hook itself.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+# Populated by cardinal-connect at install time.
+FALLBACK_HOOK = Path({fallback_repr})
+HOOK_REL = Path("hooks") / "cardinal-codex-telemetry.py"
+
+
+def _version_key(name):
+    parts = []
+    for segment in name.split("."):
+        try:
+            parts.append((0, int(segment)))
+        except ValueError:
+            parts.append((1, segment))
+    return tuple(parts)
+
+
+def _discover_newest_cached():
+    cache_root = Path.home() / ".codex" / "plugins" / "cache"
+    if not cache_root.is_dir():
+        return None
+    candidates = []
+    for owner_dir in cache_root.iterdir():
+        plugin_dir = owner_dir / "cardinal-codex-plugin"
+        if not plugin_dir.is_dir():
+            continue
+        for version_dir in plugin_dir.iterdir():
+            hook = version_dir / HOOK_REL
+            if version_dir.is_dir() and hook.is_file():
+                candidates.append((version_dir.name, hook))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: _version_key(pair[0]))
+    return candidates[-1][1]
+
+
+def main():
+    hook = _discover_newest_cached()
+    if hook is None and FALLBACK_HOOK.is_file():
+        hook = FALLBACK_HOOK
+    if hook is None:
+        # Silent no-op: telemetry must not break the agent loop.
+        return 0
+    os.execvp(sys.executable, [sys.executable, str(hook), *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def render_launcher() -> str:
+    return LAUNCHER_TEMPLATE.format(fallback_repr=repr(str(HOOK_SCRIPT)))
+
+
+def write_launcher() -> None:
+    LAUNCHER_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write(LAUNCHER_PATH, render_launcher())
+    LAUNCHER_PATH.chmod(0o755)
 
 
 def managed_hook_group(event_name: str, timeout: int, status_message: str | None = None) -> dict:
@@ -341,6 +431,7 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
                 "would_write": {
                     "codex_config": str(CONFIG_PATH) if mcp else None,
                     "codex_hooks": str(HOOKS_PATH),
+                    "telemetry_launcher": str(LAUNCHER_PATH),
                     "state": str(STATE_PATH),
                     "secrets": str(SECRETS_PATH),
                     "ingest_endpoint": ingest.get("endpoint"),
@@ -373,6 +464,9 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
 
     write_secrets(bundle)
     print(f"Wrote Cardinal local secrets to {SECRETS_PATH}")
+
+    write_launcher()
+    print(f"Wrote Cardinal telemetry launcher to {LAUNCHER_PATH}")
 
     hooks_backup = write_hooks_config()
     print(f"Wrote Cardinal hooks to {HOOKS_PATH}")
