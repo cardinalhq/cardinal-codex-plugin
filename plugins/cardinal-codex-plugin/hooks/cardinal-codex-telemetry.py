@@ -588,6 +588,9 @@ def handle_subagent_stop(payload: dict[str, Any]) -> None:
         "subagent_type": payload.get("subagent_type") or payload.get("subagentType") or payload.get("matcher"),
         "agent_id": payload.get("agent_id") or payload.get("agentId"),
         "subagent_description": subagent_description_from_payload(payload),
+        # Cross-adapter contract key; best-effort — Codex payloads carry
+        # the child's model only on some harness versions.
+        "model": payload.get("model") or payload.get("modelName") or payload.get("model_name"),
         "total_tokens": total_tokens,
         **core_session.read_plan_stamp(codex_paths()),
     }
