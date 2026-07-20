@@ -1,6 +1,6 @@
 {
   "name": "cardinal-codex-plugin",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "description": "Connect Codex to Cardinal telemetry and MCP with a browser-approved device-code flow.",
   "author": {
     "name": "CardinalHQ",
