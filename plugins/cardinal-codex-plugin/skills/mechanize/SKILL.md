@@ -100,6 +100,32 @@ Codex CLI does not have a canonical `Agent`-tool equivalent that this SKILL can 
 
 The inline pass still uses CORE.md Stage 5.5's checklist and verdict format verbatim.
 
+## Stage 8 addendum — presenting `preview.html` in Codex CLI
+
+Codex CLI has no `Artifact`-tool equivalent. After the shared renderer writes `<OUT_DIR>/preview.html`, print the absolute path plus a one-line open instruction:
+
+```
+Preview rendered: <OUT_DIR>/preview.html
+Open with: open <OUT_DIR>/preview.html   (macOS)
+           xdg-open <OUT_DIR>/preview.html   (Linux)
+```
+
+Mermaid inside the HTML will render as raw source text when opened directly in a browser (no external script loader). This is a known Codex-adapter degradation; the DAG shape, node bodies, inputs, and rationale still render fully.
+
+## Stage 9 addendum — rubric-gen and cold grading in Codex CLI
+
+**Stage 9a (rubric-gen).** Run `python3 <repo-root>/common/mechanize/review.py rubric-gen-instructions <OUT_DIR>` and follow the printed prompt yourself, inline. The prompt is written for a subagent; you are performing the subagent's role. Write `<OUT_DIR>/rubric.md` per the prompt's structure (base + appendix + falsifier). Flag the mechanism in `rationale.md` under `Unresolved`:
+
+> `Stage 9a ran inline (Codex CLI exposes no first-class subagent-spawning mechanism to this SKILL). The rubric may lean toward the compiler's own framing; a reviewer should read appendix items skeptically.`
+
+**Stage 9b (cold grading).** If the user's Codex install has a subagent-spawning MCP tool configured, use it — pass the prompt from `python3 <repo-root>/common/mechanize/review.py grade-instructions <OUT_DIR>` verbatim, with NO additional context. Instruct it to write `<OUT_DIR>/review.md`.
+
+If no MCP subagent tool is available, **skip Stage 9b entirely** and record in `rationale.md`:
+
+> `Stage 9b skipped: Codex CLI exposes no cold-subagent mechanism and per CORE.md an inline pass by the compiler is nearly worthless (defeats the warm/cold split). The rubric is available at rubric.md for manual review.`
+
+Do NOT run Stage 9b inline. Per CORE.md's Stage 9 guidance: "prefer to skip Stage 9b entirely and note that in the output rather than pretend an inline pass is a cold review."
+
 ## Now continue with CORE.md
 
 At this point you should have:
@@ -107,7 +133,7 @@ At this point you should have:
 - A segmented mental model of the session (objective, tool calls with parsed arguments, conclusion or a caveat).
 - Any spill-to-disk pairs collapsed per Stage 1.5 (if the marker exists in Codex — usually a no-op).
 
-Continue at **CORE.md Stage 2** and follow through Stage 7. When CORE.md references the Stage 4.5 chooser, apply it with the Codex attachment vocabulary caveats above. When CORE.md instructs you to spawn a Stage 5.5 cold subagent, use the mechanism above (or the inline fallback with the degradation flag).
+Continue at **CORE.md Stage 2** and follow through Stage 9. When CORE.md references the Stage 4.5 chooser, apply it with the Codex attachment vocabulary caveats above. When CORE.md instructs you to spawn a Stage 5.5 cold subagent, use the mechanism above (or the inline fallback with the degradation flag). For Stage 8, print the path per the Stage 8 addendum. For Stage 9, run 9a inline and either invoke an MCP subagent for 9b or skip it per the Stage 9 addendum.
 
 Do NOT skip any of Stages 2 through 7. Do NOT hallucinate rules that aren't in CORE.md.
 
