@@ -1,13 +1,13 @@
 ---
 name: cardinal-mechanize
-description: Compile a completed Codex CLI session (a past investigation) into a candidate Sentinel DAG plus rationale — a reusable procedure that could later be executed against a similar problem. Use when the user asks to /mechanize, compile a session, or extract a reusable investigation procedure. Spike-quality; produces YAML + rationale, does not execute anything.
+description: Compile a completed Codex CLI session (a past investigation) into a candidate Sentinel DAG plus rationale — a reusable procedure that could later be executed against a similar problem. Use when the user asks to /mechanize, compile a session, or extract a reusable investigation procedure. Compiles, then trial-executes the DAG against captured fixtures and checks it reaches the same conclusion the investigation did before emitting.
 ---
 
 # mechanize (Codex CLI) — compile a Codex CLI session into a Sentinel DAG
 
-**Spike-quality compiler.** Produces a candidate `sentinel.yaml` + `rationale.md` from a past investigation session. Does NOT execute the Sentinel; that's a separate executor. Does NOT ship — this is exploratory work, and the rationale is where the honesty lives.
+**Spike-quality compiler.** Produces a candidate `sentinel.yaml` + `rationale.md` from a past investigation session, then **runs it** — Stage 10 executes the DAG against the tool responses captured from the source session, and Stage 11 checks it reaches the conclusion the investigation reached. A compile that has not executed is not finished, and the skill reports it as such. Does NOT ship — this is exploratory work, and the rationale is where the honesty lives.
 
-This SKILL.md is the **Codex-CLI-specific** part of the mechanize skill: how to find the session, how to read Codex's session JSONL, and how to handle the pieces that differ from other agents (attachments, assistant text, cold-subagent mechanism). The shared compilation algorithm — Stages 2 through 7, the Sentinel example, the ratification checklist, the expression language, the capability registry, the rules — lives in `CORE.md`, co-located in this directory.
+This SKILL.md is the **Codex-CLI-specific** part of the mechanize skill: how to find the session, how to read Codex's session JSONL, and how to handle the pieces that differ from other agents (attachments, assistant text, cold-subagent mechanism). The shared compilation algorithm — Stages 2 through 12, the Sentinel example, the ratification checklist, the expression language, the capability registry, the rules — lives in `CORE.md`, co-located in this directory.
 
 **You MUST read `CORE.md` in full after finishing the Codex-specific stages below.**
 
@@ -133,9 +133,9 @@ At this point you should have:
 - A segmented mental model of the session (objective, tool calls with parsed arguments, conclusion or a caveat).
 - Any spill-to-disk pairs collapsed per Stage 1.5 (if the marker exists in Codex — usually a no-op).
 
-Continue at **CORE.md Stage 2** and follow through Stage 9. When CORE.md references the Stage 4.5 chooser, apply it with the Codex attachment vocabulary caveats above. When CORE.md instructs you to spawn a Stage 5.5 cold subagent, use the mechanism above (or the inline fallback with the degradation flag). For Stage 8, print the path per the Stage 8 addendum. For Stage 9, run 9a inline and either invoke an MCP subagent for 9b or skip it per the Stage 9 addendum.
+Continue at **CORE.md Stage 2** and follow through Stage 12 — including Stage 10's trial execution, which is a plain `python3` invocation and needs only this agent's shell-shaped tool. When CORE.md references the Stage 4.5 chooser, apply it with the Codex attachment vocabulary caveats above. When CORE.md instructs you to spawn a Stage 5.5 cold subagent, use the mechanism above (or the inline fallback with the degradation flag). For Stage 8, print the path per the Stage 8 addendum. For Stage 9, run 9a inline and either invoke an MCP subagent for 9b or skip it per the Stage 9 addendum.
 
-Do NOT skip any of Stages 2 through 7. Do NOT hallucinate rules that aren't in CORE.md.
+Do NOT skip any of Stages 2 through 12. In particular, do NOT stop after Stage 9 and report success: Stage 10 is what turns a plausible-looking DAG into one that has actually run, and Stage 11 is what turns one that ran into one that ran *correctly*. Do NOT hallucinate rules that aren't in CORE.md.
 
 ## Success criterion
 
