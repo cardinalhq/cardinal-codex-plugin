@@ -45,11 +45,15 @@ Cardinal/Lakerunner event contract over OTLP/HTTP:
 
 - `api_request` token usage (with plugin-computed `cost_usd`) from
   `token_count` transcript events.
-- `tool_result` plus `cardinal.turn_tool` from function call/output
-  transcript events (privacy-safe `bash_class` enum, raw qualified MCP
-  names on turn_tool).
+- `tool_result` plus `cardinal.turn_tool` from legacy function call/output
+  and current custom tool call/output transcript events (privacy-safe
+  `bash_class` enum, raw qualified MCP names on turn_tool). Single-operation
+  `functions.exec` programs are unwrapped to Bash/Edit/MCP; compound programs
+  retain only their nested tool names, never the raw JavaScript source.
 - `cardinal.git_state` on `UserPromptSubmit`, including initiative
-  classification from the branch name and slash-command detection.
+  classification from the branch name and slash-command detection. A
+  research-classified context shell is also emitted outside Git and for
+  repositories without a first commit.
 - `cardinal.turn_usage` per model call; `cardinal.plan_state` once per
   session and `cardinal.plan_usage` throttled to one snapshot per 10
   minutes, from Codex rate-limit blocks.

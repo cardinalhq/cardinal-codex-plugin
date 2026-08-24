@@ -48,6 +48,7 @@ TARGET_KEYS = {
 }
 
 EXIT_CODE_RE = re.compile(r"Process exited with code (-?\d+)")
+CUSTOM_EXEC_CALL_RE = re.compile(r"tools\.([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
 
 def codex_paths() -> AgentPaths:
@@ -147,29 +148,34 @@ def handle_user_prompt_submit(payload: dict[str, Any]) -> None:
     except Exception:
         pass
 
-    branch = None
-    repo = None
     head_sha = initiative.git(["rev-parse", "HEAD"], cwd)
-    if head_sha:
-        branch = initiative.git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
-        remote_url = initiative.git(["remote", "get-url", "origin"], cwd)
-        repo = initiative.canonical_repo(remote_url)
-        initiative_name, initiative_type = initiative.resolve_initiative(branch)
-        attrs: dict[str, Any] = {
-            "session_id": session_id,
-            "cardinal_cwd": cwd,
-            "cardinal_head_sha": head_sha,
-            "cardinal_branch": branch,
-            "cardinal_repo": repo,
-            "cardinal_remote_url": remote_url,
-            "cardinal_initiative_name": initiative_name,
-            "cardinal_initiative_type": initiative_type,
-            "cardinal_command": initiative.detect_command(
-                payload.get("prompt") or payload.get("message")
-            ),
-            **core_session.read_plan_stamp(paths),
-        }
-        emit_records([otlp.log_record("cardinal.git_state", attrs, time.time_ns())])
+    branch = initiative.git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    if not branch:
+        # rev-parse HEAD fails in a freshly initialized repository. The
+        # symbolic ref still gives us its branch, so these sessions can be
+        # classified as research instead of silently losing all context.
+        branch = initiative.git(["symbolic-ref", "--short", "HEAD"], cwd)
+    remote_url = initiative.git(["remote", "get-url", "origin"], cwd)
+    repo = initiative.canonical_repo(remote_url)
+    initiative_name, initiative_type = initiative.resolve_initiative(branch)
+    attrs: dict[str, Any] = {
+        "session_id": session_id,
+        "cardinal_cwd": cwd,
+        "cardinal_head_sha": head_sha,
+        "cardinal_branch": branch,
+        "cardinal_repo": repo,
+        "cardinal_remote_url": remote_url,
+        "cardinal_initiative_name": initiative_name,
+        "cardinal_initiative_type": initiative_type,
+        "cardinal_command": initiative.detect_command(
+            payload.get("prompt") or payload.get("message")
+        ),
+        **core_session.read_plan_stamp(paths),
+    }
+    # Emit a context shell even outside Git. Without this record, Codex
+    # sessions started from a workspace root reach Outcomes with spend but
+    # no initiative evidence and are defaulted to an in-flight feature.
+    emit_records([otlp.log_record("cardinal.git_state", attrs, time.time_ns())])
 
     # Spend-limits verdict refresh — the async half of the gate. Runs
     # AFTER the OTLP post and stays best-effort: limits must never cost
@@ -191,6 +197,116 @@ def parse_args_json(raw: Any) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def _first_js_argument(source: str, start: int) -> tuple[str, int]:
+    """Return a call's first argument and the closing separator offset.
+
+    Codex custom tools store functions.exec input as JavaScript. The wrapper
+    emits JSON literals for ordinary nested tools, so a small string-aware
+    scanner is sufficient and avoids adding a JavaScript parser dependency.
+    """
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    i = start
+    while i < len(source):
+        ch = source[i]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in {'"', "'", "`"}:
+            quote = ch
+        elif ch in "[{(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                return source[start:i].strip(), i
+            depth -= 1
+        elif ch in "]}":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            return source[start:i].strip(), i
+        i += 1
+    return source[start:].strip(), len(source)
+
+
+def extract_custom_exec_calls(source: Any) -> list[tuple[str, dict[str, Any]]]:
+    """Extract executed-looking ``tools.<name>(JSON)`` calls from exec JS.
+
+    Strings and comments are skipped so examples embedded in source do not
+    inflate tool counts. Unparseable arguments still retain the tool name.
+    """
+    if not isinstance(source, str) or not source:
+        return []
+    calls: list[tuple[str, dict[str, Any]]] = []
+    i = 0
+    quote: str | None = None
+    escaped = False
+    while i < len(source):
+        ch = source[i]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in {'"', "'", "`"}:
+            quote = ch
+            i += 1
+            continue
+        if source.startswith("//", i):
+            newline = source.find("\n", i + 2)
+            i = len(source) if newline < 0 else newline + 1
+            continue
+        if source.startswith("/*", i):
+            end_comment = source.find("*/", i + 2)
+            i = len(source) if end_comment < 0 else end_comment + 2
+            continue
+        match = CUSTOM_EXEC_CALL_RE.match(source, i)
+        if match:
+            raw_arg, end = _first_js_argument(source, match.end())
+            try:
+                decoded = json.loads(raw_arg)
+            except (json.JSONDecodeError, TypeError):
+                decoded = None
+            if isinstance(decoded, dict):
+                args = decoded
+            elif isinstance(decoded, str):
+                args = {"input": decoded}
+            else:
+                args = {}
+            calls.append((match.group(1), args))
+            i = end + 1
+            continue
+        i += 1
+    return calls
+
+
+def decode_tool_call(call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Normalize legacy function calls and current Codex custom calls."""
+    raw_name = str(call.get("name") or "")
+    if call.get("type") != "custom_tool_call":
+        return raw_name, parse_args_json(call.get("arguments"))
+
+    if raw_name in {"exec", "functions.exec"}:
+        nested = extract_custom_exec_calls(call.get("input"))
+        if len(nested) == 1:
+            return nested[0]
+        # One custom_tool_call is one model tool use. For compound executor
+        # programs, keep that cardinality and retain only nested tool names;
+        # never send the raw JavaScript program as tool_input.
+        return "exec", {"tools": [name for name, _ in nested]}
+    return raw_name, parse_args_json(call.get("input"))
 
 
 def normalize_tool_name(name: str, args: dict[str, Any]) -> tuple[str, dict[str, Any], str | None]:
@@ -348,8 +464,7 @@ def append_tool_call_event(
     state: dict[str, Any],
     ts_ns: int,
 ) -> dict[str, Any]:
-    raw_name = str(call.get("name") or "")
-    args = parse_args_json(call.get("arguments"))
+    raw_name, args = decode_tool_call(call)
     tool_name, params, target = normalize_tool_name(raw_name, args)
     if target is None:
         # Allowlisted file-path inputs (Claude parity: TARGET_KEYS is the
@@ -489,13 +604,13 @@ def handle_stop(payload: dict[str, Any]) -> None:
             continue
 
         item_type = body.get("type")
-        if item_type == "function_call":
-            call_id = body.get("call_id")
+        if item_type in {"function_call", "custom_tool_call"}:
+            call_id = body.get("call_id") or body.get("id")
             normalized = append_tool_call_event(records, session_id, body, state, ts_ns)
             if isinstance(call_id, str) and call_id:
                 pending[call_id] = normalized
             continue
-        if item_type == "function_call_output":
+        if item_type in {"function_call_output", "custom_tool_call_output"}:
             call_id = body.get("call_id")
             if isinstance(call_id, str) and call_id in pending:
                 append_tool_result_event(records, session_id, pending.pop(call_id), body.get("output"), ts_ns)
