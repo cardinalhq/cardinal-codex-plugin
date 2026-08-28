@@ -3,19 +3,24 @@
 
 from __future__ import annotations
 
-import sys                        # cardinal:py311-guard
-if sys.version_info < (3, 11):    # cardinal:py311-guard
-    import os, shutil             # cardinal:py311-guard
-    for _p in ("python3.13", "python3.12", "python3.11"):
-        _x = shutil.which(_p)
-        if _x: os.execv(_x, [_x, __file__, *sys.argv[1:]])
-    sys.stderr.write("cardinal: needs Python >=3.11 (found "
-        + sys.version.split()[0] + "). Try: brew install python@3.11\n")
-    sys.exit(1)                   # cardinal:py311-guard
-
 import json
 import sys
-import tomllib
+# tomllib is stdlib on Python 3.11+; on 3.9/3.10 fall back to the `tomli`
+# pypi backport (identical API). cardinal-connect works under 3.9 without
+# either, but this script parses ~/.codex/config.toml so it needs one.
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        sys.stderr.write(
+            "cardinal-status (codex): parsing ~/.codex/config.toml needs "
+            "Python 3.11+ (stdlib `tomllib`) or the `tomli` pypi package. "
+            "Either `brew install python@3.11` or `pip install tomli`. "
+            "cardinal-connect works under Python 3.9+.\n"
+        )
+        sys.exit(1)
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
