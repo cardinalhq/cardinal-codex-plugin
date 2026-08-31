@@ -1,0 +1,117 @@
+---
+name: semantic-dag
+description: Show the current Codex task as a live, animated semantic DAG in a local browser. Use when the user asks to watch Codex work, see live progress visually, or replace a scrolling work log with a task graph. Do not use for ordinary status summaries or static diagrams.
+---
+
+# Semantic DAG
+
+Drive a live typed task graph at `http://127.0.0.1:8766/t/<thread>` while doing the user's work. The graph is a semantic memory of the task, not an execution trace.
+
+The helper is `scripts/emit.py`, resolved relative to this file. Replace `<emit>` below with its absolute path.
+
+## Turn boundary
+
+Activation is opt-in once per Codex task, not once per prompt. The user may
+invoke `$semantic-dag` by itself or include it with the first work request.
+Run `begin` on that invocation so watch mode is bound to the native task; every
+later prompt then repaints the same viewer automatically without another skill
+mention. Do not start a DAG for unrelated tasks where the user never opted in.
+
+Before substantive work, run:
+
+```bash
+python3 <emit> begin "<2–6 word topic>"
+```
+
+`begin` uses the native Codex thread ID when available, repaints an existing thread, starts the viewer, and opens it whenever no viewer is connected. It also enables persistent watch mode for this task. The installed `UserPromptSubmit` bridge repaints the same viewer and reactivates these instructions on later prompts, even when the user invoked `$semantic-dag` in a separate turn.
+
+At the end of every turn, including blocked or failed turns, run this immediately before the final response:
+
+```bash
+python3 <emit> finish "<factual one-line outcome>"
+```
+
+`finish` ends the current graph turn but intentionally leaves watch mode enabled. The user can submit `semantic-dag off`, or run `python3 <emit> watch off`, to disable later-turn repainting for this task.
+
+## Semantic ontology
+
+Every node has exactly one first-class `type`, independent of its `status`. Use only:
+
+- `GOAL` — desired end state.
+- `QUESTION` — unresolved question that affects the work.
+- `HYPOTHESIS` — candidate explanation that can be confirmed or rejected.
+- `DECISION` — meaningful choice that constrains future work.
+- `WORK` — substantial investigation, implementation, analysis, or verification phase.
+- `EVIDENCE` — durable observation that supports or refutes something.
+- `OUTCOME` — meaningful result, resolution, or completed state.
+
+Use only these typed relationships:
+
+`decomposes_into`, `raises`, `tested_by`, `supported_by`, `refuted_by`, `resolved_by`, `based_on`, `leads_to`, `depends_on`, `produces`, `implements`, `validates`, `supersedes`.
+
+Read a relationship left to right: `hypothesis refuted_by evidence`, `question resolved_by decision`, `work produces outcome`.
+
+Statuses are lifecycle or disposition, never node types: `pending`, `active`, `paused`, `completed`, `confirmed`, `rejected`, `superseded`, `resolved`, or `error`. Thus `HYPOTHESIS(status=rejected)`, `DECISION(status=superseded)`, and `WORK(status=active)` remain distinct.
+
+## Node-worthiness test
+
+Before adding a node, ask:
+
+> Would a future agent want to retrieve this item independently and understand how it relates to the rest of the work?
+
+If not, keep it as metadata. Never create semantic nodes for individual tool calls, commands, files, glossary concepts, narration, or subagents. Attach them with `tool`, `file`, `concept`, `note`, or agent provenance instead. Prefer semantic granularity over execution granularity: one `WORK` node may contain dozens of tool calls and many file events.
+
+Reuse a stable ID when revisiting the same goal, question, hypothesis, decision, work phase, evidence, or outcome. `add` is an upsert: it updates the existing node's type, label, and supplied description while preserving its status and provenance. Do not create a near-duplicate just because the item was revisited.
+
+## Emit the graph
+
+```bash
+python3 <emit> add <id> <TYPE> "<label>" [--parent <id> | --root] [--relation <relationship>] [--description "<terse live description>"]
+python3 <emit> link <from-id> <relationship> <to-id>
+python3 <emit> activate <id>
+python3 <emit> status <id> <status> ["<reason>"]
+python3 <emit> done <id>
+python3 <emit> error <id> "<reason>"
+python3 <emit> describe <id> "<updated live description>"
+python3 <emit> note <id> "<one-line live narration>"
+python3 <emit> tool <id> "<tool-name>" "<short summary>"
+python3 <emit> file <id> <read|updated> "<path>"
+python3 <emit> concept <id> "<important term>" "<one-sentence definition>"
+python3 <emit> define "<important term>" "<one-sentence definition>"
+python3 <emit> undefine "<important term>"
+python3 <emit> watch <on|off>
+```
+
+`done` is a convenience alias for `status <id> completed`. Use `status` for semantic dispositions such as `confirmed`, `rejected`, `resolved`, or `superseded`.
+
+Create the semantic node before doing its work and activate it so the viewer pulses it in real time. Every label must be a concrete 2–7 word domain phrase that remains meaningful without the drawer, such as `Explain intermittent token expiry`, `Choose bounded retry policy`, or `Verify retry isolation`. Never use positional placeholders such as `Stacking Phase 5` or `Next Step`.
+
+An explicit `--parent` defaults to `decomposes_into`; an automatic chain defaults to `leads_to`. Supply `--relation` whenever another relationship is more accurate. Without `--parent` or `--root`, a new node chains to the most recent node owned by the same agent. Use `--root` for a genuinely independent top-level semantic item.
+
+Add a terse `--description` so the drawer explains the item in real time. `activate` automatically seeds the node's first narration entry from that description when it has no notes. Use `describe` when its meaning materially changes, then add 1–3 further useful notes for evolving facts rather than one note per tool call.
+
+Record every materially read or changed file with `file`; a path may appear in both lists. Attach domain terms with `concept`, which creates a drawer tab and dictionary entry. Use `define` only for important turn-wide terms. Do not define ordinary verbs, commands, filenames, or obvious tool names.
+
+## Subagent provenance
+
+Subagents are not semantic nodes. Their work appears through ordinary typed semantic nodes carrying agent provenance.
+
+When delegating, choose the owning semantic node and give the subagent this first command:
+
+```bash
+python3 <emit> begin "<delegated task>" --thread <root-thread> --agent <agent-id> --parent <owning-node>
+```
+
+`agent_begin` registers metadata only. The subagent's first `add` attaches to the owning node when it has no explicit parent. Node IDs are namespaced as `<agent-id>::<node-id>`, each agent may have one active node, and multiple agents may pulse concurrently. The subagent uses normal typed `add`, status, metadata, and `finish` commands; its `finish` closes only its nodes. Only root `finish` completes the graph.
+
+## Communication and controls
+
+Keep each commentary update to one sentence at meaningful transitions. Immediately before sending a progress commentary update, mirror that same user-facing sentence with `note` on the active node; do not defer narration until the end of the turn. The graph is the primary progress surface, but the final response remains self-contained. Do not narrate emission commands.
+
+```bash
+python3 <emit> url
+python3 <emit> reset "<new topic>"
+python3 <emit> topic "<new topic>"
+```
+
+Set `SEMANTIC_DAG_PORT` to change the port, `SEMANTIC_DAG_NO_OPEN=1` to suppress browser launch, or `SEMANTIC_DAG_NO_SERVER=1` for headless testing. Read [references/codex-hooks.md](references/codex-hooks.md) when installing the later-turn prompt bridge or optional automatic tool attribution; obtain confirmation before changing global hooks outside an explicitly requested installation or repair.

@@ -1,7 +1,7 @@
 {
   "name": "cardinal-codex-plugin",
-  "version": "0.20.3",
-  "description": "Connect Codex to Cardinal telemetry and MCP with a browser-approved device-code flow.",
+  "version": "0.21.0",
+  "description": "Connect Codex to Cardinal telemetry and MCP, with a live typed Semantic DAG viewer.",
   "author": {
     "name": "CardinalHQ",
     "url": "https://cardinalhq.io"
@@ -13,13 +13,14 @@
     "cardinal",
     "mcp",
     "observability",
-    "codex"
+    "codex",
+    "semantic-dag"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Cardinal",
-    "shortDescription": "Connect Codex to Cardinal telemetry and MCP tools.",
-    "longDescription": "Cardinal connects Codex to a Cardinal workspace through a device-code flow, configures the unified Cardinal MCP endpoint, and installs local Codex hooks that emit agent-session telemetry for Cardinal Outcomes.",
+    "shortDescription": "Cardinal telemetry, MCP tools, and live task DAGs.",
+    "longDescription": "Cardinal connects Codex to a Cardinal workspace, emits agent-session telemetry, configures unified MCP tools, and can show the current task as a live typed Semantic DAG.",
     "developerName": "CardinalHQ",
     "category": "Engineering",
     "capabilities": [
@@ -34,7 +35,7 @@
     "defaultPrompt": [
       "Connect Codex to Cardinal",
       "Check my Cardinal connection",
-      "Disconnect Cardinal from Codex"
+      "Watch this task as a live Semantic DAG"
     ]
   },
   "mcpServers": "./.mcp.json"
