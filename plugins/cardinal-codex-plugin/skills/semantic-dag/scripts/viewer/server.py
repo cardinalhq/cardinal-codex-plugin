@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Local HTTP/SSE viewer for Codex semantic DAG state."""
+"""Unified local HTTP/SSE viewer for Cardinal semantic DAG sessions."""
 from __future__ import annotations
 
-import html
 import hashlib
 import json
 import os
@@ -18,14 +17,18 @@ from queue import Empty, Queue
 PORT = int(os.environ.get("SEMANTIC_DAG_PORT", "8766"))
 STATE_DIR = Path(
     os.path.expanduser(
-        os.environ.get("SEMANTIC_DAG_STATE_DIR", "~/.codex/state/semantic-dag")
+        os.environ.get("SEMANTIC_DAG_STATE_DIR", "~/.cardinal/state/semantic-dag")
     )
 )
 THREADS_DIR = STATE_DIR / "threads"
 THREADS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_HTML = Path(__file__).parent / "index.html"
+CARDINAL_LOGO = Path(__file__).parent / "assets" / "cardinal-bird.png"
 EMIT = Path(__file__).resolve().parents[1] / "emit.py"
 THREAD_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+SESSION_ACTIVE_WINDOW_SECONDS = int(
+    os.environ.get("SEMANTIC_DAG_ACTIVE_WINDOW_SECONDS", "120")
+)
 
 _subscribers: dict[str, list[Queue]] = {}
 _subscriber_lock = threading.Lock()
@@ -41,12 +44,13 @@ def _load_dag(thread: str) -> dict:
     except (OSError, ValueError):
         return {
             "thread": thread,
+            "runtime": "unknown",
             "topic": "",
             "nodes": {},
             "edges": [],
             "active": None,
             "active_by_agent": {},
-            "agents": {"root": {"id": "root", "label": "Primary agent", "status": "active"}},
+            "agents": {"root": {"id": "root", "label": "Root", "status": "active"}},
             "finished": False,
             "summary": "",
         }
@@ -107,10 +111,46 @@ def _tail_events() -> None:
             time.sleep(0.5)
 
 
+def _session_status(dag: dict, updated: float, *, now: float | None = None) -> str:
+    """Summarize persisted workflow state without calling stale work live."""
+    statuses = {
+        str(node.get("status") or "pending")
+        for node in dag.get("nodes", {}).values()
+        if isinstance(node, dict)
+    }
+    if "error" in statuses:
+        return "error"
+    if dag.get("finished"):
+        return "completed"
+    has_active = bool(dag.get("active_by_agent")) or "active" in statuses
+    if has_active:
+        age = max(0.0, (time.time() if now is None else now) - updated)
+        return "active" if age <= SESSION_ACTIVE_WINDOW_SECONDS else "stale"
+    if "paused" in statuses:
+        return "paused"
+    terminal = {
+        "completed", "confirmed", "rejected", "resolved", "superseded", "done"
+    }
+    if statuses and statuses <= terminal:
+        return "completed"
+    return "pending"
+
+
 def _list_threads() -> list[dict]:
     threads = []
-    directories = [path for path in THREADS_DIR.iterdir() if path.is_dir()]
-    for directory in sorted(directories, key=lambda path: path.stat().st_mtime, reverse=True):
+    directories = []
+    for path in THREADS_DIR.iterdir():
+        if not path.is_dir():
+            continue
+        dag_file = path / "dag.json"
+        try:
+            updated = dag_file.stat().st_mtime
+        except OSError:
+            updated = path.stat().st_mtime
+        directories.append((path, updated))
+    for directory, updated in sorted(
+        directories, key=lambda item: item[1], reverse=True
+    ):
         if not THREAD_RE.fullmatch(directory.name):
             continue
         dag = _load_dag(directory.name)
@@ -118,30 +158,15 @@ def _list_threads() -> list[dict]:
             {
                 "thread": directory.name,
                 "topic": dag.get("topic", ""),
+                "runtime": dag.get("runtime", "unknown"),
                 "finished": bool(dag.get("finished")),
+                "status": _session_status(dag, updated),
                 "nodes": len(dag.get("nodes", {})),
+                "agents": len(dag.get("agents", {})),
+                "updated": updated,
             }
         )
     return threads
-
-
-def _render_thread_index() -> bytes:
-    rows = []
-    for item in _list_threads():
-        mark = "✓" if item["finished"] else "●"
-        state_class = "done" if item["finished"] else "live"
-        topic = html.escape(item["topic"] or "(no topic)")
-        thread = html.escape(item["thread"])
-        rows.append(
-            f'<a class="row" href="/t/{thread}"><span class="{state_class}">{mark}</span>'
-            f'<strong>{topic}</strong><small>{thread} · {item["nodes"]} nodes</small></a>'
-        )
-    body = """<!doctype html><html><head><meta charset="utf-8"><title>Semantic DAG</title>
-<style>
-body{margin:0;background:#090b10;color:#e9edf5;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:48px}
-main{max-width:760px;margin:auto}h1{font-size:20px;margin:0 0 24px}.row{display:grid;grid-template-columns:24px 1fr auto;gap:10px;align-items:center;padding:14px 16px;margin:8px 0;border:1px solid #283041;border-radius:10px;background:#111621;color:inherit;text-decoration:none}.row:hover{border-color:#6ea8ff}.live{color:#6ea8ff}.done{color:#4ade80}small{color:#7f899a}</style>
-</head><body><main><h1>Semantic DAG tasks</h1>""" + ("".join(rows) or '<p style="color:#7f899a">No tasks yet.</p>') + "</main></body></html>"
-    return body.encode()
 
 
 def _viewer_version() -> str:
@@ -189,8 +214,20 @@ class Handler(BaseHTTPRequestHandler):
                 "application/json",
             )
             return
+        if path == "/assets/cardinal-bird.png":
+            try:
+                self._send(200, CARDINAL_LOGO.read_bytes(), "image/png")
+            except OSError:
+                self._send(404, "logo missing", "text/plain")
+            return
+        if path == "/sessions":
+            self._send(200, json.dumps({"sessions": _list_threads()}), "application/json")
+            return
         if path == "/":
-            self._send(200, _render_thread_index(), "text/html; charset=utf-8")
+            try:
+                self._send(200, _render_viewer(), "text/html; charset=utf-8")
+            except OSError:
+                self._send(500, "viewer HTML missing", "text/plain")
             return
         parsed = self._thread_path()
         if parsed is None:

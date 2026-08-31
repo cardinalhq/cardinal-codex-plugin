@@ -7,6 +7,8 @@ description: Show the current Codex task as a live, animated semantic DAG in a l
 
 Drive a live typed task graph at `http://127.0.0.1:8766/t/<thread>` while doing the user's work. The graph is a semantic memory of the task, not an execution trace.
 
+The viewer is one Cardinal workspace shared with Claude at `~/.cardinal/state/semantic-dag`. Its left navigation lists every session and marks the originating runtime. Inside a session, launched agents appear in the Agent team roster as a separate hierarchy above the workflow; never model agents as semantic DAG nodes.
+
 The helper is `scripts/emit.py`, resolved relative to this file. Replace `<emit>` below with its absolute path.
 
 ## Turn boundary
@@ -60,7 +62,7 @@ Before adding a node, ask:
 
 > Would a future agent want to retrieve this item independently and understand how it relates to the rest of the work?
 
-If not, keep it as metadata. Never create semantic nodes for individual tool calls, commands, files, glossary concepts, narration, or subagents. Attach them with `tool`, `file`, `concept`, `note`, or agent provenance instead. Prefer semantic granularity over execution granularity: one `WORK` node may contain dozens of tool calls and many file events.
+If not, keep it as metadata. Never create semantic nodes for individual tool calls, commands, files, glossary concepts, narration, or subagents. Attach commands, concepts, and narration with `tool`, `concept`, `note`, or agent provenance; the session bridge attaches file metadata automatically. Prefer semantic granularity over execution granularity: one `WORK` node may contain dozens of tool calls and many file events.
 
 Reuse a stable ID when revisiting the same goal, question, hypothesis, decision, work phase, evidence, or outcome. `add` is an upsert: it updates the existing node's type, label, and supplied description while preserving its status and provenance. Do not create a near-duplicate just because the item was revisited.
 
@@ -76,7 +78,6 @@ python3 <emit> error <id> "<reason>"
 python3 <emit> describe <id> "<updated live description>"
 python3 <emit> note <id> "<one-line live narration>"
 python3 <emit> tool <id> "<tool-name>" "<short summary>"
-python3 <emit> file <id> <read|updated> "<path>"
 python3 <emit> concept <id> "<important term>" "<one-sentence definition>"
 python3 <emit> define "<important term>" "<one-sentence definition>"
 python3 <emit> undefine "<important term>"
@@ -91,7 +92,7 @@ An explicit `--parent` defaults to `decomposes_into`; an automatic chain default
 
 Add a terse `--description` so the drawer explains the item in real time. `activate` automatically seeds the node's first narration entry from that description when it has no notes. Use `describe` when its meaning materially changes, then add 1–3 further useful notes for evolving facts rather than one note per tool call.
 
-Record every materially read or changed file with `file`; a path may appear in both lists. Attach domain terms with `concept`, which creates a drawer tab and dictionary entry. Use `define` only for important turn-wide terms. Do not define ordinary verbs, commands, filenames, or obvious tool names.
+File attribution is automatic and out of band: the Codex session-event bridge records completed structured reads and file changes on the active node. Do not emit file metadata manually. Attach domain terms with `concept`, which creates a drawer tab and dictionary entry. Use `define` only for important turn-wide terms. Do not define ordinary verbs, commands, filenames, or obvious tool names.
 
 ## Glossary discipline
 
@@ -103,13 +104,13 @@ Keep this bounded: do not add more than three new terms in one turn unless the u
 
 Subagents are not semantic nodes. Their work appears through ordinary typed semantic nodes carrying agent provenance.
 
-When delegating, choose the owning semantic node and give the subagent this first command:
+When delegating, choose the owning semantic node and give the subagent this first command. Always pass the agent's real user-facing name; for a nested launch, also pass its launching agent:
 
 ```bash
-python3 <emit> begin "<delegated task>" --thread <root-thread> --agent <agent-id> --parent <owning-node>
+python3 <emit> begin "<delegated task>" --thread <root-thread> --agent <agent-id> --agent-label "<agent-name>" --parent <owning-node> [--parent-agent <launching-agent-id>]
 ```
 
-`agent_begin` registers metadata only. The subagent's first `add` attaches to the owning node when it has no explicit parent. Node IDs are namespaced as `<agent-id>::<node-id>`, each agent may have one active node, and multiple agents may pulse concurrently. The subagent uses normal typed `add`, status, metadata, and `finish` commands; its `finish` closes only its nodes. Only root `finish` completes the graph.
+`agent_begin` registers the agent display name, assigned task, launching agent, and owning workflow node as metadata only. The subagent's first `add` attaches to the owning node when it has no explicit parent. Node IDs are namespaced as `<agent-id>::<node-id>`, each agent may have one active node, and multiple agents may pulse concurrently. The subagent uses normal typed `add`, status, metadata, and `finish` commands; its `finish` closes only its nodes. Only root `finish` completes the graph.
 
 ## Communication and controls
 
@@ -121,4 +122,4 @@ python3 <emit> reset "<new topic>"
 python3 <emit> topic "<new topic>"
 ```
 
-Set `SEMANTIC_DAG_PORT` to change the port, `SEMANTIC_DAG_NO_OPEN=1` to suppress browser launch, or `SEMANTIC_DAG_NO_SERVER=1` for headless testing. Read [references/codex-hooks.md](references/codex-hooks.md) when installing the later-turn prompt bridge or optional automatic tool attribution; obtain confirmation before changing global hooks outside an explicitly requested installation or repair.
+Set `SEMANTIC_DAG_PORT` to change the port, `SEMANTIC_DAG_NO_OPEN=1` to suppress browser launch, or `SEMANTIC_DAG_NO_SERVER=1` for headless testing. Read [references/codex-hooks.md](references/codex-hooks.md) when installing the later-turn prompt bridge or lifecycle-hook fallback; obtain confirmation before changing global hooks outside an explicitly requested installation or repair.
