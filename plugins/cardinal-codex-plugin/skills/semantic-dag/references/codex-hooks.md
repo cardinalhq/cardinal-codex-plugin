@@ -30,9 +30,14 @@ this matcher group into `UserPromptSubmit` and replace `<plugin-root>`:
 `finish` does not disable watch mode. The exact prompt `semantic-dag off` or
 the CLI command `emit.py watch off` disables it for that task.
 
-## Optional tool attribution
+## Optional tool and file attribution
 
-The viewer does not require hooks. This optional `PreToolUse` hook automatically paints the most recent tool as a badge on the currently active semantic node.
+The viewer does not require hooks. The optional `PreToolUse` hook paints the
+most recent tool as a badge on the currently active semantic node. The matching
+`PostToolUse` hook records files read or updated only after the tool succeeds.
+Direct file tools and `apply_patch` targets are exact; shell attribution is
+best effort and deliberately limited to common read, redirect, copy, move, and
+mutation commands.
 
 The Cardinal connect flow also installs this quiet bridge. For a manual
 development checkout, inspect `~/.codex/hooks.json` and merge this entry
@@ -44,7 +49,20 @@ without overwriting unrelated hooks:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": ".*",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 <plugin-root>/skills/semantic-dag/scripts/hooks/tool_hook.py",
+            "timeout": 3,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -59,6 +77,8 @@ without overwriting unrelated hooks:
 }
 ```
 
-If the file already has a `PreToolUse` list, append the matcher group. Codex will ask the user to trust newly discovered personal hooks. Do not bypass hook trust.
+If the file already has a `PreToolUse` or `PostToolUse` list, append the
+corresponding matcher group. Codex will ask the user to trust newly discovered
+personal hooks. Do not bypass hook trust.
 
 The hook uses the `session_id` in Codex's event payload to find the right DAG, so concurrent Codex tasks in the same working directory remain isolated.

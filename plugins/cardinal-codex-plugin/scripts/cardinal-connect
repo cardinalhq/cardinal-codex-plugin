@@ -192,8 +192,8 @@ def managed_semantic_hook_command(kind: str) -> str:
 
 
 # Stable launcher script. Codex hooks.json points here, and this shim
-# resolves the newest installed plugin version at invocation time. Written
-# atomically on every connect; overwrites cleanly on plugin upgrade.
+# resolves the connected plugin root or newest installed cache at invocation
+# time. Written atomically on every connect; overwrites cleanly on upgrade.
 LAUNCHER_TEMPLATE = '''\
 #!/usr/bin/env python3
 """cardinal-codex-plugin telemetry launcher (stable path).
@@ -202,10 +202,11 @@ Installed by cardinal-connect at ~/.codex/cardinal/. hooks.json references
 THIS file, not the versioned plugin-cache path — so when Codex upgrades the
 plugin and removes the old cache dir, hooks.json still resolves.
 
-Behavior: pick the newest installed plugin version under
-~/.codex/plugins/cache/<owner>/cardinal-codex-plugin/*/ and exec the requested
-telemetry or Semantic DAG hook. If none is installed, fall back to the plugin
-root known at connect time (covers manual/dev installs outside the cache).
+Behavior: prefer the plugin root known at connect time, then fall back to the
+newest installed plugin version under
+~/.codex/plugins/cache/<owner>/cardinal-codex-plugin/*/. This keeps a connected
+development checkout authoritative while still surviving removal of an old
+versioned cache directory during a normal plugin upgrade.
 
 Telemetry is best-effort: any failure exits 0 silently, per the same
 policy as the hook itself.
@@ -261,10 +262,8 @@ def main():
     elif "--semantic-dag-tool" in arguments:
         hook_rel = SEMANTIC_TOOL_REL
         arguments.remove("--semantic-dag-tool")
-    hook = _discover_newest_cached(hook_rel)
     fallback_hook = FALLBACK_PLUGIN_ROOT / hook_rel
-    if hook is None and fallback_hook.is_file():
-        hook = fallback_hook
+    hook = fallback_hook if fallback_hook.is_file() else _discover_newest_cached(hook_rel)
     if hook is None:
         # Silent no-op: telemetry must not break the agent loop.
         return 0
@@ -311,6 +310,14 @@ def managed_semantic_hook_group(kind: str, matcher: str = "", async_hook: bool =
     return {"matcher": matcher, "hooks": [hook]}
 
 
+def _is_managed_or_legacy_semantic_hook(command: object) -> bool:
+    value = str(command or "")
+    return "cardinal-codex-plugin" in value or (
+        "semantic-dag" in value
+        and ("prompt_hook.py" in value or "tool_hook.py" in value)
+    )
+
+
 def strip_managed_hooks(data: dict) -> dict:
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
@@ -332,7 +339,7 @@ def strip_managed_hooks(data: dict) -> dict:
                 h for h in handlers
                 if not (
                     isinstance(h, dict)
-                    and "cardinal-codex-plugin" in str(h.get("command") or "")
+                    and _is_managed_or_legacy_semantic_hook(h.get("command"))
                 )
             ]
             if kept_handlers:
@@ -360,7 +367,10 @@ def write_hooks_config() -> Path | None:
         managed_semantic_hook_group("prompt")
     )
     hooks.setdefault("PreToolUse", []).append(
-        managed_semantic_hook_group("tool", ".*", async_hook=True)
+        managed_semantic_hook_group("tool", "*", async_hook=True)
+    )
+    hooks.setdefault("PostToolUse", []).append(
+        managed_semantic_hook_group("tool", "*", async_hook=True)
     )
     hooks.setdefault("Stop", []).append(
         managed_hook_group("Stop", 10, "Reporting Cardinal session telemetry")
@@ -372,6 +382,41 @@ def write_hooks_config() -> Path | None:
     backup_path = backup(HOOKS_PATH)
     atomic_write(HOOKS_PATH, json.dumps(data, indent=2) + "\n")
     return backup_path
+
+
+def repair_hooks(dry_run: bool = False) -> int:
+    """Refresh Semantic DAG hooks without rotating Cardinal credentials."""
+    missing = [
+        path for path in (HOOK_SCRIPT, SEMANTIC_PROMPT_HOOK, SEMANTIC_TOOL_HOOK)
+        if not path.is_file()
+    ]
+    if missing:
+        sys.exit("Required hook script is missing: " + ", ".join(map(str, missing)))
+    if dry_run:
+        print(json.dumps({
+            "would_write": {
+                "codex_hooks": str(HOOKS_PATH),
+                "telemetry_launcher": str(LAUNCHER_PATH),
+            },
+            "plugin_root": str(PLUGIN_ROOT),
+            "plugin_version": PLUGIN_VERSION,
+        }, indent=2))
+        return 0
+
+    write_launcher()
+    print(f"Wrote Cardinal telemetry launcher to {LAUNCHER_PATH}")
+    hooks_backup = write_hooks_config()
+    print(f"Wrote Cardinal hooks to {HOOKS_PATH}")
+    if hooks_backup:
+        print(f"Hooks backup: {hooks_backup}")
+
+    if STATE_PATH.exists():
+        state = load_json_object(STATE_PATH, "cardinal.json")
+        state["plugin_version"] = PLUGIN_VERSION
+        atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
+        print(f"Updated Cardinal state version in {STATE_PATH}")
+    print("Restart Codex so it reloads the repaired hook config.")
+    return 0
 
 
 def write_secrets(bundle: dict) -> None:
@@ -541,6 +586,11 @@ def parse_args() -> argparse.Namespace:
         help="Proceed even if Cardinal state already exists and mint a fresh key.",
     )
     parser.add_argument(
+        "--repair-hooks",
+        action="store_true",
+        help="Refresh the Cardinal launcher and hooks without rotating credentials.",
+    )
+    parser.add_argument(
         "--telemetry-only",
         action="store_true",
         help="Only configure Cardinal telemetry hooks; skip the MCP credential.",
@@ -560,6 +610,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    if args.repair_hooks:
+        return repair_hooks(args.dry_run)
 
     if STATE_PATH.exists() and not args.rotate:
         try:
