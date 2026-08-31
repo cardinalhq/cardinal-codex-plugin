@@ -6,8 +6,10 @@ Skills are selected per prompt, so a standalone `$semantic-dag` invocation
 does not by itself guarantee that the next unrelated question reloads the
 skill. The included `UserPromptSubmit` bridge closes that gap. `begin` records
 watch mode against the native task binding; later prompts repaint the existing
-thread and receive context to use the skill again. The hook is silent for
-tasks where watch mode was never enabled.
+thread and receive a compact continuation protocol. The full skill is named
+only as an edge-case reference, avoiding a repeated full-file prompt cost on
+ordinary turns. The hook is silent for tasks where watch mode was never
+enabled.
 
 The Cardinal connect flow installs this bridge through its stable launcher,
 without overwriting unrelated hooks. For a manual development checkout, merge
