@@ -1,0 +1,4 @@
+interface:
+  display_name: "Semantic DAG"
+  short_description: "Watch Codex work as a live semantic DAG"
+  default_prompt: "Use $semantic-dag to enable persistent live DAG watch mode for this task and later prompts until I say semantic-dag off."

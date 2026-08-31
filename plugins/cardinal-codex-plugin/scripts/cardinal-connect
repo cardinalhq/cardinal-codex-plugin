@@ -45,6 +45,8 @@ MCP_SERVER_NAME = "cardinal"
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 HOOK_SCRIPT = PLUGIN_ROOT / "hooks" / "cardinal-codex-telemetry.py"
+SEMANTIC_PROMPT_HOOK = PLUGIN_ROOT / "skills/semantic-dag/scripts/hooks/prompt_hook.py"
+SEMANTIC_TOOL_HOOK = PLUGIN_ROOT / "skills/semantic-dag/scripts/hooks/tool_hook.py"
 
 CODEX_DIR = Path.home() / ".codex"
 CONFIG_PATH = CODEX_DIR / "config.toml"
@@ -182,6 +184,13 @@ def managed_hook_command(event_name: str) -> str:
     )
 
 
+def managed_semantic_hook_command(kind: str) -> str:
+    return (
+        f"python3 {shlex.quote(str(LAUNCHER_PATH))} "
+        f"--semantic-dag-{kind} # cardinal-codex-plugin"
+    )
+
+
 # Stable launcher script. Codex hooks.json points here, and this shim
 # resolves the newest installed plugin version at invocation time. Written
 # atomically on every connect; overwrites cleanly on plugin upgrade.
@@ -194,10 +203,9 @@ THIS file, not the versioned plugin-cache path — so when Codex upgrades the
 plugin and removes the old cache dir, hooks.json still resolves.
 
 Behavior: pick the newest installed plugin version under
-~/.codex/plugins/cache/<owner>/cardinal-codex-plugin/*/hooks/ and exec its
-hook with our argv. If none is installed, fall back to FALLBACK_HOOK (the
-absolute path known at connect time — covers manual/dev installs where the
-plugin lives outside the versioned cache).
+~/.codex/plugins/cache/<owner>/cardinal-codex-plugin/*/ and exec the requested
+telemetry or Semantic DAG hook. If none is installed, fall back to the plugin
+root known at connect time (covers manual/dev installs outside the cache).
 
 Telemetry is best-effort: any failure exits 0 silently, per the same
 policy as the hook itself.
@@ -209,8 +217,10 @@ import sys
 from pathlib import Path
 
 # Populated by cardinal-connect at install time.
-FALLBACK_HOOK = Path({fallback_repr})
-HOOK_REL = Path("hooks") / "cardinal-codex-telemetry.py"
+FALLBACK_PLUGIN_ROOT = Path({fallback_root_repr})
+TELEMETRY_REL = Path("hooks") / "cardinal-codex-telemetry.py"
+SEMANTIC_PROMPT_REL = Path("skills") / "semantic-dag" / "scripts" / "hooks" / "prompt_hook.py"
+SEMANTIC_TOOL_REL = Path("skills") / "semantic-dag" / "scripts" / "hooks" / "tool_hook.py"
 
 
 def _version_key(name):
@@ -223,7 +233,7 @@ def _version_key(name):
     return tuple(parts)
 
 
-def _discover_newest_cached():
+def _discover_newest_cached(hook_rel):
     cache_root = Path.home() / ".codex" / "plugins" / "cache"
     if not cache_root.is_dir():
         return None
@@ -233,7 +243,7 @@ def _discover_newest_cached():
         if not plugin_dir.is_dir():
             continue
         for version_dir in plugin_dir.iterdir():
-            hook = version_dir / HOOK_REL
+            hook = version_dir / hook_rel
             if version_dir.is_dir() and hook.is_file():
                 candidates.append((version_dir.name, hook))
     if not candidates:
@@ -243,13 +253,22 @@ def _discover_newest_cached():
 
 
 def main():
-    hook = _discover_newest_cached()
-    if hook is None and FALLBACK_HOOK.is_file():
-        hook = FALLBACK_HOOK
+    arguments = sys.argv[1:]
+    hook_rel = TELEMETRY_REL
+    if "--semantic-dag-prompt" in arguments:
+        hook_rel = SEMANTIC_PROMPT_REL
+        arguments.remove("--semantic-dag-prompt")
+    elif "--semantic-dag-tool" in arguments:
+        hook_rel = SEMANTIC_TOOL_REL
+        arguments.remove("--semantic-dag-tool")
+    hook = _discover_newest_cached(hook_rel)
+    fallback_hook = FALLBACK_PLUGIN_ROOT / hook_rel
+    if hook is None and fallback_hook.is_file():
+        hook = fallback_hook
     if hook is None:
         # Silent no-op: telemetry must not break the agent loop.
         return 0
-    os.execvp(sys.executable, [sys.executable, str(hook), *sys.argv[1:]])
+    os.execvp(sys.executable, [sys.executable, str(hook), *arguments])
 
 
 if __name__ == "__main__":
@@ -258,7 +277,7 @@ if __name__ == "__main__":
 
 
 def render_launcher() -> str:
-    return LAUNCHER_TEMPLATE.format(fallback_repr=repr(str(HOOK_SCRIPT)))
+    return LAUNCHER_TEMPLATE.format(fallback_root_repr=repr(str(PLUGIN_ROOT)))
 
 
 def write_launcher() -> None:
@@ -279,6 +298,17 @@ def managed_hook_group(event_name: str, timeout: int, status_message: str | None
         "matcher": "",
         "hooks": [hook],
     }
+
+
+def managed_semantic_hook_group(kind: str, matcher: str = "", async_hook: bool = False) -> dict:
+    hook = {
+        "type": "command",
+        "command": managed_semantic_hook_command(kind),
+        "timeout": 3,
+    }
+    if async_hook:
+        hook["async"] = True
+    return {"matcher": matcher, "hooks": [hook]}
 
 
 def strip_managed_hooks(data: dict) -> dict:
@@ -325,6 +355,12 @@ def write_hooks_config() -> Path | None:
     )
     hooks.setdefault("UserPromptSubmit", []).append(
         managed_hook_group("UserPromptSubmit", 5, "Reporting Cardinal git context")
+    )
+    hooks.setdefault("UserPromptSubmit", []).append(
+        managed_semantic_hook_group("prompt")
+    )
+    hooks.setdefault("PreToolUse", []).append(
+        managed_semantic_hook_group("tool", ".*", async_hook=True)
     )
     hooks.setdefault("Stop", []).append(
         managed_hook_group("Stop", 10, "Reporting Cardinal session telemetry")
@@ -455,6 +491,9 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
 
     if not HOOK_SCRIPT.exists():
         sys.exit(f"Telemetry hook script is missing: {HOOK_SCRIPT}")
+    for semantic_hook in (SEMANTIC_PROMPT_HOOK, SEMANTIC_TOOL_HOOK):
+        if not semantic_hook.exists():
+            sys.exit(f"Semantic DAG hook script is missing: {semantic_hook}")
 
     if mcp:
         backup_path = write_codex_config(mcp["url"], mcp["api_key"])
