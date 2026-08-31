@@ -47,6 +47,7 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 HOOK_SCRIPT = PLUGIN_ROOT / "hooks" / "cardinal-codex-telemetry.py"
 SEMANTIC_PROMPT_HOOK = PLUGIN_ROOT / "skills/semantic-dag/scripts/hooks/prompt_hook.py"
 SEMANTIC_TOOL_HOOK = PLUGIN_ROOT / "skills/semantic-dag/scripts/hooks/tool_hook.py"
+SEMANTIC_SESSION_BRIDGE = PLUGIN_ROOT / "skills/semantic-dag/scripts/session_bridge.py"
 
 CODEX_DIR = Path.home() / ".codex"
 CONFIG_PATH = CODEX_DIR / "config.toml"
@@ -387,7 +388,13 @@ def write_hooks_config() -> Path | None:
 def repair_hooks(dry_run: bool = False) -> int:
     """Refresh Semantic DAG hooks without rotating Cardinal credentials."""
     missing = [
-        path for path in (HOOK_SCRIPT, SEMANTIC_PROMPT_HOOK, SEMANTIC_TOOL_HOOK)
+        path
+        for path in (
+            HOOK_SCRIPT,
+            SEMANTIC_PROMPT_HOOK,
+            SEMANTIC_TOOL_HOOK,
+            SEMANTIC_SESSION_BRIDGE,
+        )
         if not path.is_file()
     ]
     if missing:
@@ -536,9 +543,13 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
 
     if not HOOK_SCRIPT.exists():
         sys.exit(f"Telemetry hook script is missing: {HOOK_SCRIPT}")
-    for semantic_hook in (SEMANTIC_PROMPT_HOOK, SEMANTIC_TOOL_HOOK):
-        if not semantic_hook.exists():
-            sys.exit(f"Semantic DAG hook script is missing: {semantic_hook}")
+    for semantic_component in (
+        SEMANTIC_PROMPT_HOOK,
+        SEMANTIC_TOOL_HOOK,
+        SEMANTIC_SESSION_BRIDGE,
+    ):
+        if not semantic_component.exists():
+            sys.exit(f"Semantic DAG component is missing: {semantic_component}")
 
     if mcp:
         backup_path = write_codex_config(mcp["url"], mcp["api_key"])

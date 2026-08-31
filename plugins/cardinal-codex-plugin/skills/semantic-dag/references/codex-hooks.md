@@ -32,14 +32,22 @@ this matcher group into `UserPromptSubmit` and replace `<plugin-root>`:
 `finish` does not disable watch mode. The exact prompt `semantic-dag off` or
 the CLI command `emit.py watch off` disables it for that task.
 
-## Optional tool and file attribution
+## Structured file attribution
 
-The viewer does not require hooks. The optional `PreToolUse` hook paints the
-most recent tool as a badge on the currently active semantic node. The matching
-`PostToolUse` hook records files read or updated only after the tool succeeds.
-Direct file tools and `apply_patch` targets are exact; shell attribution is
-best effort and deliberately limited to common read, redirect, copy, move, and
-mutation commands.
+Every semantic emission ensures that a quiet session-event bridge is running
+for the native Codex task, so later-turn resets recover automatically after a
+process or application restart. The bridge tails Codex's completed local
+session records and attaches
+`CommandExecution.parsed_cmd` reads plus exact `FileChange.changes` updates to
+the node that was active when each record completed. It checkpoints its byte
+offset under the Semantic DAG state directory, deduplicates materialized paths,
+and never adds content to the model prompt.
+
+The personal lifecycle hooks remain a compatibility fallback for Codex
+runtimes that emit `PreToolUse` and `PostToolUse`. `PreToolUse` paints the most
+recent tool as a badge; `PostToolUse` uses the same conservative classifier for
+successful direct file tools and common shell commands. File attribution must
+not rely on model-generated `file` commands.
 
 The Cardinal connect flow also installs this quiet bridge. For a manual
 development checkout, inspect `~/.codex/hooks.json` and merge this entry
@@ -83,4 +91,5 @@ If the file already has a `PreToolUse` or `PostToolUse` list, append the
 corresponding matcher group. Codex will ask the user to trust newly discovered
 personal hooks. Do not bypass hook trust.
 
-The hook uses the `session_id` in Codex's event payload to find the right DAG, so concurrent Codex tasks in the same working directory remain isolated.
+Both paths use the native session binding to find the right DAG, so concurrent
+Codex tasks in the same working directory remain isolated.
