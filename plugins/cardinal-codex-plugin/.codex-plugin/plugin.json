@@ -1,6 +1,6 @@
 {
   "name": "cardinal-codex-plugin",
-  "version": "0.21.5",
+  "version": "0.21.6",
   "description": "Connect Codex to Cardinal telemetry and MCP, with a live typed Semantic DAG viewer.",
   "author": {
     "name": "CardinalHQ",
