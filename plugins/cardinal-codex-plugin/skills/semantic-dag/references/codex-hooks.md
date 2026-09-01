@@ -32,12 +32,21 @@ this matcher group into `UserPromptSubmit` and replace `<plugin-root>`:
 `finish` does not disable watch mode. The exact prompt `semantic-dag off` or
 the CLI command `emit.py watch off` disables it for that task.
 
-## Structured file attribution
+## Native activity bridge
 
 Every semantic emission ensures that a quiet session-event bridge is running
 for the native Codex task, so later-turn resets recover automatically after a
 process or application restart. The bridge tails Codex's completed local
-session records and attaches
+session records and mirrors native progress commentary onto the agent's active
+node. If a registered subagent has no active node, its first commentary creates
+and activates a provisional `WORK` node linked to the delegated parent. The
+viewer therefore shows useful subagent activity without depending on the model
+to emit narration commands. Native message IDs and a short text/time window
+suppress duplicates when both structured record forms—or an explicit `note`—
+carry the same update. A native subagent final response also completes its open
+nodes and supplies the agent summary unless an explicit `finish` already did so.
+
+The same bridge attaches
 `CommandExecution.parsed_cmd` reads plus exact `FileChange.changes` updates to
 the node that was active when each record completed. It checkpoints its byte
 offset under the Semantic DAG state directory, deduplicates materialized paths,
