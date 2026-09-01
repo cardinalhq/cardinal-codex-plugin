@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Attach Codex session file events to the active Semantic DAG node.
+"""Attach native Codex session activity to the active Semantic DAG node.
 
 Codex Desktop writes completed execution items to its session JSONL.  This
 bridge consumes the structured ``CommandExecution.parsed_cmd`` and
-``FileChange.changes`` fields directly, so file attribution does not depend on
-model instructions or lifecycle-hook coverage.
+``FileChange.changes`` fields directly, and mirrors assistant commentary as
+live narration.  Subagents receive a provisional active work node on their
+first native update, so useful progress never depends on model-authored
+Semantic DAG commands.
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -166,6 +169,67 @@ def file_events_from_session_record(record: object) -> list[tuple[str, str]]:
     return unique
 
 
+def _assistant_message(record: object) -> dict | None:
+    if not isinstance(record, dict):
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    if record.get("type") == "event_msg" and payload.get("type") == "item_completed":
+        item = payload.get("item")
+        if isinstance(item, dict) and item.get("type") == "AgentMessage":
+            return item
+    if (
+        record.get("type") == "response_item"
+        and payload.get("type") == "message"
+        and payload.get("role") == "assistant"
+    ):
+        return payload
+    return None
+
+
+def _message_text(message: dict) -> str:
+    parts: list[str] = []
+    for item in message.get("content") or []:
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            text = " ".join(item["text"].split())
+            if text:
+                parts.append(text)
+    return " ".join(parts)
+
+
+def commentary_from_session_record(record: object) -> list[tuple[str | None, str]]:
+    """Extract user-visible Codex commentary, excluding reasoning and finals.
+
+    Codex currently records the same assistant message as both an
+    ``item_completed/AgentMessage`` event and a ``response_item/message``.
+    Returning the native message id lets the emitter collapse that pair.
+    """
+    message = _assistant_message(record)
+
+    if not message or message.get("phase") != "commentary":
+        return []
+    source_id = message.get("id")
+    source_id = source_id if isinstance(source_id, str) and source_id else None
+    text = _message_text(message)
+    return [(source_id, text)] if text else []
+
+
+def final_from_session_record(record: object) -> tuple[str | None, str] | None:
+    """Extract a concise subagent completion summary from its native final."""
+    message = _assistant_message(record)
+    if not message or message.get("phase") != "final":
+        return None
+    source_id = message.get("id")
+    source_id = source_id if isinstance(source_id, str) and source_id else None
+    text = _message_text(message)
+    if not text:
+        return None
+    summary = text if len(text) <= 240 else text[:237].rstrip() + "…"
+    return source_id, summary
+
+
 def _display_path(path: str, dag: dict) -> str:
     candidate = Path(path)
     project = Path(str(dag.get("cwd") or os.getcwd()))
@@ -232,18 +296,121 @@ def _active_at(thread: str, agent: str, completed_at: float | None, dag: dict) -
     return active_by_agent.get(agent)
 
 
+def _activity_label(agent: str, metadata: dict) -> str:
+    source = str(metadata.get("task") or metadata.get("label") or agent)
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'/-]*", source)[:7]
+    if len(words) == 1:
+        words.append("work")
+    return " ".join(words) if words else "Handle delegated work"
+
+
+def _ensure_subagent_activity(
+    thread: str,
+    agent: str,
+    completed_at: float | None,
+    dag: dict,
+) -> str | None:
+    """Create a stable live-work surface when a subagent has no active node."""
+    if agent == "root":
+        return None
+    metadata = (dag.get("agents") or {}).get(agent)
+    if not isinstance(metadata, dict):
+        return None
+    node_id = f"{agent}::__activity"
+    timestamp = completed_at or time.time()
+    if node_id not in (dag.get("nodes") or {}):
+        event = {
+            "type": "add",
+            "id": node_id,
+            "local_id": "__activity",
+            "semantic_type": "WORK",
+            "label": _activity_label(agent, metadata),
+            "description": str(metadata.get("task") or metadata.get("description") or "Delegated work"),
+            "agent": agent,
+            "source": "codex-session",
+            "provisional": True,
+            "ts": timestamp,
+        }
+        parent = metadata.get("parent")
+        if isinstance(parent, str) and parent:
+            event["parent"] = parent
+            event["relationship"] = "decomposes_into"
+        emit(thread, event)
+    emit(
+        thread,
+        {
+            "type": "activate",
+            "id": node_id,
+            "agent": agent,
+            "source": "codex-session",
+            "ts": timestamp + 0.000001,
+        },
+    )
+    return node_id
+
+
+def _note_is_duplicate(dag: dict, node_id: str, source_id: str | None, text: str) -> bool:
+    notes = ((dag.get("nodes") or {}).get(node_id) or {}).get("notes") or []
+    if source_id and any(note.get("source_id") == source_id for note in notes):
+        return True
+    now = time.time()
+    return any(
+        note.get("text") == text
+        and isinstance(note.get("ts"), (int, float))
+        and abs(now - float(note["ts"])) <= 15
+        for note in notes[-5:]
+    )
+
+
 def _emit_record(session: str, record: dict) -> None:
     file_events = file_events_from_session_record(record)
-    if not file_events:
+    commentary = commentary_from_session_record(record)
+    final = final_from_session_record(record)
+    if not file_events and not commentary and not final:
         return
     binding = _binding(session)
     thread = str(binding.get("thread") or session)
     agent = str(binding.get("agent") or "root")
     dag_path = _state_dir() / "threads" / _safe_id(thread) / "dag.json"
     dag = _read_json(dag_path)
-    active = _active_at(thread, agent, _record_time(record), dag)
+    completed_at = _record_time(record)
+    active = _active_at(thread, agent, completed_at, dag)
+    agent_completed = ((dag.get("agents") or {}).get(agent) or {}).get("status") == "completed"
+    if active is None and (commentary or final) and not agent_completed:
+        active = _ensure_subagent_activity(thread, agent, completed_at, dag)
+        dag = _read_json(dag_path)
     if active is None:
         return
+    for source_id, text in commentary:
+        if _note_is_duplicate(dag, active, source_id, text):
+            continue
+        emit(
+            thread,
+            {
+                "type": "note",
+                "id": active,
+                "agent": agent,
+                "text": text,
+                "source": "codex-session",
+                "source_id": source_id,
+            },
+        )
+        dag = _read_json(dag_path)
+    if final and agent != "root":
+        metadata = (dag.get("agents") or {}).get(agent) or {}
+        if metadata.get("status") != "completed":
+            source_id, summary = final
+            emit(
+                thread,
+                {
+                    "type": "agent_finish",
+                    "agent": agent,
+                    "summary": summary,
+                    "source": "codex-session",
+                    "source_id": source_id,
+                },
+            )
+            dag = _read_json(dag_path)
     for kind, path in file_events:
         emit(
             thread,

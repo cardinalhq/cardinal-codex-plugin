@@ -110,11 +110,11 @@ When delegating, choose the owning semantic node and give the subagent this firs
 python3 <emit> begin "<delegated task>" --thread <root-thread> --agent <agent-id> --agent-label "<agent-name>" --parent <owning-node> [--parent-agent <launching-agent-id>]
 ```
 
-`agent_begin` registers the agent display name, assigned task, launching agent, and owning workflow node as metadata only. The launching relationship appears in the separate Agents topology view. The subagent's first `add` records the owning-node relationship in state, but its nodes render only in that subagent's own Workflow DAG. Node IDs are namespaced as `<agent-id>::<node-id>`, each agent may have one active node, and multiple agents may pulse concurrently. The subagent uses normal typed `add`, status, metadata, and `finish` commands; its `finish` closes only its nodes. Only root `finish` completes the graph.
+`agent_begin` registers the agent display name, assigned task, launching agent, and owning workflow node. On the subagent's first native Codex commentary, the session bridge creates and activates a provisional `WORK` node automatically, so its pane has a live task and narration even if the subagent emits no further graph commands. Its native final response completes that node and the agent automatically. Explicit durable nodes still render only in that subagent's own Workflow DAG and are namespaced as `<agent-id>::<node-id>`. Each agent may have one active node, and multiple agents may pulse concurrently. The subagent uses normal typed `add`, status, metadata, and `finish` commands only when it needs richer semantics or a custom concise completion summary. Only root `finish` completes the graph.
 
 ## Communication and controls
 
-Keep each commentary update to one sentence at meaningful transitions. Immediately before sending a progress commentary update, mirror that same user-facing sentence with `note` on the active node; do not defer narration until the end of the turn. The graph is the primary progress surface, but the final response remains self-contained. Do not narrate emission commands.
+Keep each commentary update to one sentence at meaningful transitions. The Codex session bridge mirrors native commentary onto the active node automatically and suppresses duplicates, so do not repeat ordinary commentary with `note`. Use `note` only for graph narration that was not sent to the user. The graph is the primary progress surface, but the final response remains self-contained. Do not narrate emission commands.
 
 ```bash
 python3 <emit> url
