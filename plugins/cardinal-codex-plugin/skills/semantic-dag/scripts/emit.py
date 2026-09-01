@@ -13,7 +13,7 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[3]
 REPO_ROOT = Path(__file__).resolve().parents[5]
-for candidate in (PLUGIN_ROOT / "hooks", REPO_ROOT / "core"):
+for candidate in (REPO_ROOT / "core", PLUGIN_ROOT / "hooks"):
     if (candidate / "cardinal_core" / "semantic_dag.py").is_file():
         sys.path.insert(0, str(candidate))
         break
@@ -25,7 +25,13 @@ CONFIG = RuntimeConfig(
     runtime="codex",
     default_state_dir="~/.cardinal/state/semantic-dag",
     default_port=8766,
-    viewer_dir=Path(__file__).resolve().parent / "viewer",
+    viewer_dir=(
+        REPO_ROOT / "common" / "semantic-dag" / "viewer"
+        if (REPO_ROOT / "common" / "semantic-dag" / "viewer").is_dir()
+        else Path(__file__).resolve().parent / "viewer"
+    ),
+    plugin_root=PLUGIN_ROOT,
+    emit_path=Path(__file__).resolve(),
     native_thread_env=(
         "CODEX_THREAD_ID",
         "CODEX_SESSION_ID",
