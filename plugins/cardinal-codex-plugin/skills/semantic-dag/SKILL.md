@@ -13,15 +13,15 @@ The helper is `scripts/emit.py`, resolved relative to this file. Replace `<emit>
 
 ## Turn boundary
 
-The installed prompt bridge enables watch mode by default for every new Codex
-task, binds the native task, seeds its first GOAL, and injects the compact
-emission protocol. When that context says default watch mode is active, do not
-run `begin` again. This is a global structural default, stored in the shared
-Semantic DAG config rather than repeated in individual prompts.
+Activation is opt-in at the plugin level. The installed prompt bridge maintains
+watch mode for tasks that explicitly activated the skill. A user may also make
+new tasks default-on in their own user space with `watch-default on`; that
+setting is stored in `~/.cardinal/state/semantic-dag/config.json`, not in the
+plugin. When the bridge says user-default watch mode is active, do not run
+`begin` again.
 
-If the bridge is unavailable or the global default was disabled, the user may
-still invoke `$semantic-dag` explicitly. On that manual activation, run `begin`
-so watch mode is bound to the native task.
+When the user invokes `$semantic-dag` explicitly, run `begin` so watch mode is
+bound to the native task.
 
 For manual activation only, before substantive work run:
 
@@ -29,7 +29,7 @@ For manual activation only, before substantive work run:
 python3 <emit> begin "<2–6 word topic>"
 ```
 
-`begin` uses the native Codex thread ID when available, repaints an existing thread, starts the viewer, and opens it whenever no viewer is connected. It also enables persistent watch mode for this task. The installed `UserPromptSubmit` bridge creates new default-on tasks and repaints existing ones while supplying a compact version of the required emission protocol. It points back to this full skill only for edge cases so normal continuation turns do not repeatedly load this entire file.
+`begin` uses the native Codex thread ID when available, repaints an existing thread, starts the viewer, and opens it whenever no viewer is connected. It also enables persistent watch mode for this task. The installed `UserPromptSubmit` bridge repaints active tasks and, when enabled by the user's `watch-default` setting, creates new watched tasks while supplying a compact version of the required emission protocol. It points back to this full skill only for edge cases so normal continuation turns do not repeatedly load this entire file.
 
 At the end of every turn, including blocked or failed turns, run this immediately before the final response:
 
@@ -129,7 +129,8 @@ python3 <emit> topic "<new topic>"
 
 Set `SEMANTIC_DAG_PORT` to change the port, `SEMANTIC_DAG_NO_OPEN=1` to suppress browser launch, or `SEMANTIC_DAG_NO_SERVER=1` for headless testing. Read [references/codex-hooks.md](references/codex-hooks.md) when installing the later-turn prompt bridge or lifecycle-hook fallback; obtain confirmation before changing global hooks outside an explicitly requested installation or repair.
 
-`watch off` disables only the current task. `watch-default off` disables
-automatic activation for new tasks, and `watch-default on` restores it. The
-`SEMANTIC_DAG_WATCH_DEFAULT` environment variable can override that global
+`watch off` disables only the current task. Plugin installs are opt-in by
+default. `watch-default on` enables automatic activation for new tasks in the
+current user's state, while `watch-default off` disables that user preference.
+The `SEMANTIC_DAG_WATCH_DEFAULT` environment variable can override the user
 setting for one process.

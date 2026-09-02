@@ -3,23 +3,25 @@
 ## Persistent later-turn repaint
 
 Skills are selected per prompt, so model instructions alone cannot reliably
-make Semantic DAG a session-wide default. The included `UserPromptSubmit`
-bridge closes that gap structurally: it creates and binds a watched DAG on the
-first prompt of every new task, then repaints that thread and supplies a compact
-continuation protocol on later prompts. The full skill is named only as an
-edge-case reference, avoiding a repeated full-file prompt cost on ordinary
-turns.
+keep Semantic DAG active across a task. The included `UserPromptSubmit` bridge
+repaints explicitly activated tasks and supplies a compact continuation
+protocol on later prompts. Plugin installs remain opt-in. Users who want every
+new task watched can enable that preference in their own state, without
+changing the plugin for everyone. The full skill is named only as an edge-case
+reference, avoiding a repeated full-file prompt cost on ordinary turns.
 
-The default is stored at `~/.cardinal/state/semantic-dag/config.json` and can
-be changed without editing hook files:
+The user preference is stored at
+`~/.cardinal/state/semantic-dag/config.json` and can be changed without editing
+hook files:
 
 ```bash
 python3 <emit> watch-default off
 python3 <emit> watch-default on
 ```
 
-An existing task that was explicitly switched off remains off. The global
-setting only controls automatic activation of new, unbound tasks.
+An existing task that was explicitly switched off remains off. The user
+setting only controls automatic activation of new, unbound tasks; absent that
+setting, the plugin does not start Semantic DAG automatically.
 
 The Cardinal connect flow installs this bridge through its stable launcher,
 without overwriting unrelated hooks. For a manual development checkout, merge
