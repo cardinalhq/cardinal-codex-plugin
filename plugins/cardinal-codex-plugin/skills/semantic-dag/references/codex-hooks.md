@@ -38,7 +38,12 @@ Every semantic emission ensures that a quiet session-event bridge is running
 for the native Codex task, so later-turn resets recover automatically after a
 process or application restart. The bridge tails Codex's completed local
 session records and mirrors native progress commentary onto the agent's active
-node. If a registered subagent has no active node, its first commentary creates
+node. A native `sub_agent_activity(kind="started")` record registers each new
+agent immediately, records its launch hierarchy and owning active node, binds
+the child thread to the same DAG, and starts a child tailer. The binding carries
+the launch timestamp: forked parent history is ignored while output from a
+child that finishes before its tailer starts is still consumed. If a registered
+subagent has no active node, its first commentary creates
 and activates a provisional `WORK` node linked to the delegated parent. The
 viewer therefore shows useful subagent activity without depending on the model
 to emit narration commands. Native message IDs and a short text/time window

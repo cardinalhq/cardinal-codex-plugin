@@ -11,6 +11,7 @@ Semantic DAG commands.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -60,9 +61,6 @@ def _write_json(path: Path, value: dict) -> None:
 
 
 def _safe_id(value: str) -> str:
-    import hashlib
-    import re
-
     return value if re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value) else (
         "c-" + hashlib.sha1(value.encode()).hexdigest()[:16]
     )
@@ -230,6 +228,110 @@ def final_from_session_record(record: object) -> tuple[str | None, str] | None:
     return source_id, summary
 
 
+def subagent_start_from_session_record(record: object) -> dict | None:
+    """Extract an authoritative native Codex subagent launch event."""
+    if not isinstance(record, dict) or record.get("type") != "event_msg":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "sub_agent_activity":
+        return None
+    if payload.get("kind") != "started":
+        return None
+    agent_thread_id = payload.get("agent_thread_id")
+    agent_path = payload.get("agent_path")
+    if not isinstance(agent_thread_id, str) or not agent_thread_id.strip():
+        return None
+    if not isinstance(agent_path, str) or not agent_path.startswith("/root/"):
+        return None
+    return {
+        "thread_id": agent_thread_id.strip(),
+        "path": agent_path.rstrip("/"),
+        "started_at": (
+            float(payload["occurred_at_ms"]) / 1000.0
+            if isinstance(payload.get("occurred_at_ms"), (int, float))
+            else _record_time(record)
+        ),
+    }
+
+
+def _agent_id_from_path(agent_path: str) -> str:
+    """Map a canonical Codex agent path to a stable Semantic DAG agent id."""
+    relative = agent_path.removeprefix("/root/").strip("/")
+    candidate = relative.replace("/", ".")
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", candidate):
+        return candidate
+    return "agent-" + hashlib.sha1(agent_path.encode()).hexdigest()[:10]
+
+
+def _agent_label_from_path(agent_path: str) -> str:
+    leaf = agent_path.rstrip("/").rsplit("/", 1)[-1]
+    words = re.sub(r"[_\-.]+", " ", leaf).strip()
+    return words.title() if words else "Delegated Agent"
+
+
+def _start_child_bridge(session: str) -> None:
+    """Start the child tailer after its binding exists."""
+    environment = os.environ.copy()
+    environment["SEMANTIC_DAG_STATE_DIR"] = str(_state_dir())
+    # A parent-only test/debug override must never make the child tail the
+    # parent's transcript.
+    environment.pop("CODEX_SESSION_LOG", None)
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "start", "--session", session],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=sys.platform != "win32",
+    )
+
+
+def _register_subagent_start(session: str, record: dict) -> bool:
+    """Register and bind a child from the parent's native launch record."""
+    started = subagent_start_from_session_record(record)
+    if started is None:
+        return False
+    binding = _binding(session)
+    thread = str(binding.get("thread") or session)
+    parent_agent = str(binding.get("agent") or "root")
+    agent = _agent_id_from_path(started["path"])
+    child_session = started["thread_id"]
+    dag_path = _state_dir() / "threads" / _safe_id(thread) / "dag.json"
+    dag = _read_json(dag_path)
+
+    child_binding = _state_dir() / "bindings" / f"{_safe_id(child_session)}.json"
+    _write_json(
+        child_binding,
+        {
+            "thread": thread,
+            "agent": agent,
+            "since": started["started_at"] or time.time(),
+        },
+    )
+
+    if agent not in (dag.get("agents") or {}):
+        parent = _active_at(thread, parent_agent, started["started_at"], dag)
+        label = _agent_label_from_path(started["path"])
+        event = {
+            "type": "agent_begin",
+            "agent": agent,
+            "label": label,
+            "task": label,
+            "parent_agent": parent_agent,
+            "description": f"Codex agent {label} is working on delegated work.",
+            "native_thread": child_session,
+            "source": "codex-session",
+            "ts": started["started_at"] or time.time(),
+        }
+        if parent:
+            event["parent"] = parent
+        emit(thread, event)
+
+    if not os.environ.get("SEMANTIC_DAG_NO_CHILD_BRIDGE"):
+        _start_child_bridge(child_session)
+    return True
+
+
 def _display_path(path: str, dag: dict) -> str:
     candidate = Path(path)
     project = Path(str(dag.get("cwd") or os.getcwd()))
@@ -363,6 +465,8 @@ def _note_is_duplicate(dag: dict, node_id: str, source_id: str | None, text: str
 
 
 def _emit_record(session: str, record: dict) -> None:
+    if _register_subagent_start(session, record):
+        return
     file_events = file_events_from_session_record(record)
     commentary = commentary_from_session_record(record)
     final = final_from_session_record(record)
@@ -432,7 +536,11 @@ def _watch_enabled(session: str) -> bool:
     return bool(dag.get("watch_mode"))
 
 
-def _process_available(stream, session: str) -> int:
+def _process_available(
+    stream,
+    session: str,
+    not_before: float | None = None,
+) -> int:
     while True:
         offset = stream.tell()
         line = stream.readline()
@@ -444,6 +552,9 @@ def _process_available(stream, session: str) -> int:
         try:
             record = json.loads(line)
         except ValueError:
+            continue
+        record_time = _record_time(record) if isinstance(record, dict) else None
+        if not_before is not None and record_time is not None and record_time < not_before:
             continue
         try:
             _emit_record(session, record)
@@ -481,15 +592,35 @@ def run_bridge(session: str, once: bool = False, from_start: bool = False) -> in
         if not locked:
             return 0
         transcript = _session_log(session)
+        if transcript is None and not once:
+            # A native `started` record can reach the parent just before the
+            # child's rollout file is visible. Keep this detached process
+            # alive briefly so the launch cannot fall through that race.
+            deadline = time.time() + 10
+            while transcript is None and time.time() < deadline:
+                if not _watch_enabled(session):
+                    return 0
+                time.sleep(0.1)
+                transcript = _session_log(session)
         if transcript is None:
             return 0
         checkpoint_path = _checkpoint_path(session)
         checkpoint = _read_json(checkpoint_path)
         same_transcript = checkpoint.get("transcript") == str(transcript)
+        binding = _binding(session)
+        not_before = binding.get("since")
+        if not isinstance(not_before, (int, float)):
+            not_before = None
         if from_start:
             offset = 0
         elif same_transcript and isinstance(checkpoint.get("offset"), int):
             offset = min(checkpoint["offset"], transcript.stat().st_size)
+        elif not_before is not None:
+            # Native child transcripts contain a forked copy of the parent's
+            # history. Scan from the beginning so already-completed fast-child
+            # output is retained, but discard every record before the native
+            # launch timestamp.
+            offset = 0
         else:
             offset = transcript.stat().st_size
 
@@ -509,7 +640,7 @@ def run_bridge(session: str, once: bool = False, from_start: bool = False) -> in
         with transcript.open(encoding="utf-8") as stream:
             stream.seek(offset)
             while True:
-                next_offset = _process_available(stream, session)
+                next_offset = _process_available(stream, session, not_before)
                 if next_offset != offset:
                     offset = next_offset
                     checkpoint_offset()
