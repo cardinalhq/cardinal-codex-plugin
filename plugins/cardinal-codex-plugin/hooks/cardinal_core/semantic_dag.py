@@ -103,11 +103,23 @@ def _safe_thread(value: str | None) -> str | None:
 
 
 def _native_thread() -> str | None:
-    value = next(
+    return _safe_thread(_native_session_id())
+
+
+def _native_session_id() -> str | None:
+    """Raw (non-hashed) session_id from the host runtime's env, if any.
+
+    Distinct from `_native_thread`, which hashes the raw value into a stable
+    thread id. Session tagging on the cwd pointer needs the RAW id so a
+    prompt hook holding `payload["session_id"]` can compare directly.
+    """
+    override = os.environ.get("SEMANTIC_DAG_SESSION_ID")
+    if override:
+        return override
+    return next(
         (os.environ.get(key) for key in _config().native_thread_env if os.environ.get(key)),
         None,
     )
-    return _safe_thread(value)
 
 
 def _safe_agent(value: str | None) -> str:
@@ -152,16 +164,54 @@ def _pointer_path() -> Path:
     return _state_dir() / f"current-{_cwd_key()}"
 
 
-def _read_pointer() -> str | None:
+def _read_pointer_record() -> dict | None:
+    """Return `{thread, session_id}` for the cwd pointer, or None.
+
+    The cwd pointer is a within-session convenience — the emitter writes it
+    at `start`/`begin` and the prompt hook reads it on the very next
+    UserPromptSubmit to attach a binding for the current session_id. It is
+    NOT authoritative across sessions; callers that care about session
+    identity (the prompt hook) MUST compare `session_id` against their own
+    before adopting the thread.
+
+    Legacy pointers stored the bare thread id as plain text. Those are
+    returned as `{thread, session_id: None}` — every session-checking
+    caller will refuse to adopt them, which is the correct migration
+    behavior (a stale pre-fix pointer can never bridge sessions).
+    """
     try:
-        return _safe_thread(_pointer_path().read_text().strip())
+        raw = _pointer_path().read_text().strip()
     except OSError:
         return None
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        thread = _safe_thread(parsed.get("thread"))
+        if thread is None:
+            return None
+        session = parsed.get("session_id")
+        return {"thread": thread, "session_id": session if isinstance(session, str) else None}
+    thread = _safe_thread(raw)
+    if thread is None:
+        return None
+    return {"thread": thread, "session_id": None}
 
 
-def _write_pointer(thread: str) -> None:
+def _read_pointer() -> str | None:
+    record = _read_pointer_record()
+    return record["thread"] if record else None
+
+
+def _write_pointer(thread: str, session_id: str | None = None) -> None:
     _state_dir().mkdir(parents=True, exist_ok=True)
-    _pointer_path().write_text(thread)
+    if session_id is None:
+        session_id = _native_session_id()
+    payload = {"thread": thread, "session_id": session_id}
+    _pointer_path().write_text(json.dumps(payload))
 
 
 def _binding_path() -> Path | None:
@@ -186,18 +236,29 @@ def _write_binding(thread: str, agent: str) -> None:
         path.write_text(json.dumps({"thread": thread, "agent": agent}))
 
 
-def _thread_dir(thread: str) -> Path:
+def _thread_dir(thread: str, *, create: bool = True) -> Path:
     directory = _threads_dir() / thread
-    directory.mkdir(parents=True, exist_ok=True)
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
     return directory
 
 
-def _events_file(thread: str) -> Path:
-    return _thread_dir(thread) / "events.jsonl"
+def _events_file(thread: str, *, create: bool = True) -> Path:
+    return _thread_dir(thread, create=create) / "events.jsonl"
 
 
-def _dag_file(thread: str) -> Path:
-    return _thread_dir(thread) / "dag.json"
+def _dag_file(thread: str, *, create: bool = True) -> Path:
+    return _thread_dir(thread, create=create) / "dag.json"
+
+
+def _thread_exists(thread: str) -> bool:
+    """True once a thread has been started, without materializing anything.
+
+    Deliberately does not create the directory: callers use this to decide
+    whether an event is allowed to bring a thread into existence, so the
+    check itself must leave no trace.
+    """
+    return _dag_file(thread, create=False).is_file()
 
 
 def _new_thread_id() -> str:
@@ -718,8 +779,26 @@ def _activation_note(dag: dict, event: dict) -> dict | None:
     }
 
 
+# Only the `start`/`begin` command may bring a thread into existence. Every
+# other event is an edit to a thread that must already have been started.
+# Without this gate a dangling cwd pointer (or a session deleted from the
+# viewer mid-turn) resurrects the thread id as an empty-topic shard: no
+# `start` event, no topic, and `--parent` references to nodes that only ever
+# existed in the DAG that was thrown away.
+_THREAD_CREATING_EVENTS = frozenset({"start", "agent_begin"})
+
+
+class ThreadNotStarted(ValueError):
+    """An event targeted a thread that was never started."""
+
+
 def emit(thread: str, event: dict) -> None:
     event.setdefault("ts", time.time())
+    if event["type"] not in _THREAD_CREATING_EVENTS and not _thread_exists(thread):
+        raise ThreadNotStarted(
+            f"thread {thread} has not been started; run `emit.py start \"<topic>\"` "
+            "first (a stale cwd pointer or a deleted session can leave this id dangling)"
+        )
     with _thread_lock(thread):
         dag = _load_dag(thread)
         _apply(dag, event)
@@ -955,9 +1034,11 @@ def main(config: RuntimeConfig) -> int:
             parent_agent = _safe_agent(_pop_flag(arguments, "--parent-agent"))
             agent_label = _pop_flag(arguments, "--agent-label")
             description = _pop_flag(arguments, "--description")
-            topic = arguments[0] if arguments else ""
+            topic = arguments[0].strip() if arguments else ""
+            if agent == "root" and not topic:
+                raise ValueError('usage: start "<2–6 word topic>"')
             thread = override or shared or _native_thread() or _read_pointer() or _new_thread_id()
-            existed = _dag_file(thread).exists()
+            existed = _thread_exists(thread)
             if agent == "root":
                 event_type = "reset" if command == "begin" and existed else "start"
                 event = {

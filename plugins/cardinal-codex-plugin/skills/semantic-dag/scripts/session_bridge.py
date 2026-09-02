@@ -35,13 +35,13 @@ def _load_runtime():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     from cardinal_core.file_events import file_events_from_hook
-    from cardinal_core.semantic_dag import configure, emit
+    from cardinal_core.semantic_dag import ThreadNotStarted, configure, emit
 
     configure(module.CONFIG)
-    return module.CONFIG, emit, file_events_from_hook
+    return module.CONFIG, emit, file_events_from_hook, ThreadNotStarted
 
 
-CONFIG, emit, file_events_from_hook = _load_runtime()
+CONFIG, emit, file_events_from_hook, ThreadNotStarted = _load_runtime()
 
 
 def _read_json(path: Path) -> dict:
@@ -445,7 +445,15 @@ def _process_available(stream, session: str) -> int:
             record = json.loads(line)
         except ValueError:
             continue
-        _emit_record(session, record)
+        try:
+            _emit_record(session, record)
+        except ThreadNotStarted:
+            # The thread was deleted from the viewer between resolving the
+            # active node and writing to it. There is nothing left to append
+            # to, and re-materializing it is exactly the empty-topic shard we
+            # refuse elsewhere. Leave the checkpoint on this record; the
+            # `_watch_enabled` check ends the bridge on the next pass.
+            return offset
 
 
 @contextmanager
