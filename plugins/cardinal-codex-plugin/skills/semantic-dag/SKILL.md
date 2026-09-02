@@ -13,20 +13,23 @@ The helper is `scripts/emit.py`, resolved relative to this file. Replace `<emit>
 
 ## Turn boundary
 
-Activation is opt-in once per Codex task, not once per prompt. The user may
-invoke `$semantic-dag` by itself or include it with the first work request.
-Run `begin` on that invocation so watch mode is bound to the native task; every
-later prompt then repaints the same viewer automatically and injects a compact
-continuation protocol without another skill mention. Do not start a DAG for
-unrelated tasks where the user never opted in.
+The installed prompt bridge enables watch mode by default for every new Codex
+task, binds the native task, seeds its first GOAL, and injects the compact
+emission protocol. When that context says default watch mode is active, do not
+run `begin` again. This is a global structural default, stored in the shared
+Semantic DAG config rather than repeated in individual prompts.
 
-Before substantive work, run:
+If the bridge is unavailable or the global default was disabled, the user may
+still invoke `$semantic-dag` explicitly. On that manual activation, run `begin`
+so watch mode is bound to the native task.
+
+For manual activation only, before substantive work run:
 
 ```bash
 python3 <emit> begin "<2–6 word topic>"
 ```
 
-`begin` uses the native Codex thread ID when available, repaints an existing thread, starts the viewer, and opens it whenever no viewer is connected. It also enables persistent watch mode for this task. The installed `UserPromptSubmit` bridge repaints the same viewer and supplies a compact version of the required emission protocol on later prompts, even when the user invoked `$semantic-dag` in a separate turn. It points back to this full skill only for edge cases so normal continuation turns do not repeatedly load this entire file.
+`begin` uses the native Codex thread ID when available, repaints an existing thread, starts the viewer, and opens it whenever no viewer is connected. It also enables persistent watch mode for this task. The installed `UserPromptSubmit` bridge creates new default-on tasks and repaints existing ones while supplying a compact version of the required emission protocol. It points back to this full skill only for edge cases so normal continuation turns do not repeatedly load this entire file.
 
 At the end of every turn, including blocked or failed turns, run this immediately before the final response:
 
@@ -82,6 +85,7 @@ python3 <emit> concept <id> "<important term>" "<one-sentence definition>"
 python3 <emit> define "<important term>" "<one-sentence definition>"
 python3 <emit> undefine "<important term>"
 python3 <emit> watch <on|off>
+python3 <emit> watch-default <on|off>
 ```
 
 `done` is a convenience alias for `status <id> completed`. Use `status` for semantic dispositions such as `confirmed`, `rejected`, `resolved`, or `superseded`.
@@ -91,6 +95,11 @@ Create the semantic node before doing its work and activate it so the viewer pul
 An explicit `--parent` defaults to `decomposes_into`; an automatic chain defaults to `leads_to`. Supply `--relation` whenever another relationship is more accurate. Without `--parent` or `--root`, a new node chains to the most recent node owned by the same agent. Use `--root` for a genuinely independent top-level semantic item.
 
 Add a terse `--description` so the drawer explains the item in real time. `activate` automatically seeds the node's first narration entry from that description when it has no notes. Use `describe` when its meaning materially changes, then add 1–3 further useful notes for evolving facts rather than one note per tool call.
+
+Agent cards present a plain-language **Problem Statement** and **Solution**.
+Write topics, delegated tasks, node descriptions, progress notes, and finish
+summaries for a non-technical reader: say what needs to be accomplished and
+what was found or changed, without exposing tool names or internal mechanics.
 
 File attribution is automatic and out of band: the Codex session-event bridge records completed structured reads and file changes on the active node. Do not emit file metadata manually. Attach domain terms with `concept`, which creates a drawer tab and dictionary entry. Use `define` only for important turn-wide terms. Do not define ordinary verbs, commands, filenames, or obvious tool names.
 
@@ -119,3 +128,8 @@ python3 <emit> topic "<new topic>"
 ```
 
 Set `SEMANTIC_DAG_PORT` to change the port, `SEMANTIC_DAG_NO_OPEN=1` to suppress browser launch, or `SEMANTIC_DAG_NO_SERVER=1` for headless testing. Read [references/codex-hooks.md](references/codex-hooks.md) when installing the later-turn prompt bridge or lifecycle-hook fallback; obtain confirmation before changing global hooks outside an explicitly requested installation or repair.
+
+`watch off` disables only the current task. `watch-default off` disables
+automatic activation for new tasks, and `watch-default on` restores it. The
+`SEMANTIC_DAG_WATCH_DEFAULT` environment variable can override that global
+setting for one process.
