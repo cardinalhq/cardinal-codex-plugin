@@ -508,6 +508,10 @@ def _apply(dag: dict, event: dict) -> None:
             "task": event.get("task", ""),
             "description": event.get("description", ""),
         }
+        if event.get("native_thread"):
+            agents[agent]["native_thread"] = event["native_thread"]
+        if event.get("source"):
+            agents[agent]["source"] = event["source"]
         return
     if event_type == "agent_finish":
         for node in dag["nodes"].values():

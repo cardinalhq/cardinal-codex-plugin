@@ -104,13 +104,9 @@ Keep this bounded: do not add more than three new terms in one turn unless the u
 
 Subagents are not semantic nodes. Their work appears through ordinary typed semantic nodes carrying agent provenance.
 
-When delegating, choose the owning semantic node and give the subagent this first command. Always pass the agent's real user-facing name; for a nested launch, also pass its launching agent:
+Before delegating, activate the semantic node that owns the delegated work. The native Codex session bridge consumes the authoritative `sub_agent_activity(kind="started")` record, registers the agent display name and launch hierarchy, links it to that active owning node, binds the child thread to this DAG, and starts a child tailer. Do not require the subagent to run `begin` merely to appear in the graph.
 
-```bash
-python3 <emit> begin "<delegated task>" --thread <root-thread> --agent <agent-id> --agent-label "<agent-name>" --parent <owning-node> [--parent-agent <launching-agent-id>]
-```
-
-`agent_begin` registers the agent display name, assigned task, launching agent, and owning workflow node. On the subagent's first native Codex commentary, the session bridge creates and activates a provisional `WORK` node automatically, so its pane has a live task and narration even if the subagent emits no further graph commands. Its native final response completes that node and the agent automatically. Explicit durable nodes still render only in that subagent's own Workflow DAG and are namespaced as `<agent-id>::<node-id>`. Each agent may have one active node, and multiple agents may pulse concurrently. The subagent uses normal typed `add`, status, metadata, and `finish` commands only when it needs richer semantics or a custom concise completion summary. Only root `finish` completes the graph.
+On the subagent's first native Codex commentary, the child bridge creates and activates a provisional `WORK` node automatically, so its pane has a live task and narration even if the subagent emits no graph commands. Its native final response completes that node and the agent automatically. Explicit durable nodes still render only in that subagent's own Workflow DAG and are namespaced as `<agent-id>::<node-id>`. Each agent may have one active node, and multiple agents may pulse concurrently. The child binding supplies its agent identity, so the subagent uses normal typed `add`, status, metadata, and `finish` commands only when it needs richer semantics or a custom concise completion summary. Only root `finish` completes the graph.
 
 ## Communication and controls
 
