@@ -62,7 +62,7 @@ def _ensure_session_bridge(arguments: list[str]) -> None:
         return
     if os.environ.get("SEMANTIC_DAG_NO_SESSION_BRIDGE"):
         return
-    if arguments[0] == "finish" or (
+    if arguments[0] in ("finish", "watch-default") or (
         arguments[0] == "watch" and any(value.lower() == "off" for value in arguments[1:])
     ):
         return
