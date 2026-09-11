@@ -45,9 +45,6 @@ MCP_SERVER_NAME = "cardinal"
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 HOOK_SCRIPT = PLUGIN_ROOT / "hooks" / "cardinal-codex-telemetry.py"
-SEMANTIC_PROMPT_HOOK = PLUGIN_ROOT / "skills/semantic-dag/scripts/hooks/prompt_hook.py"
-SEMANTIC_TOOL_HOOK = PLUGIN_ROOT / "skills/semantic-dag/scripts/hooks/tool_hook.py"
-SEMANTIC_SESSION_BRIDGE = PLUGIN_ROOT / "skills/semantic-dag/scripts/session_bridge.py"
 
 CODEX_DIR = Path.home() / ".codex"
 CONFIG_PATH = CODEX_DIR / "config.toml"
@@ -185,13 +182,6 @@ def managed_hook_command(event_name: str) -> str:
     )
 
 
-def managed_semantic_hook_command(kind: str) -> str:
-    return (
-        f"python3 {shlex.quote(str(LAUNCHER_PATH))} "
-        f"--semantic-dag-{kind} # cardinal-codex-plugin"
-    )
-
-
 # Stable launcher script. Codex hooks.json points here, and this shim
 # resolves the connected plugin root or newest installed cache at invocation
 # time. Written atomically on every connect; overwrites cleanly on upgrade.
@@ -221,8 +211,6 @@ from pathlib import Path
 # Populated by cardinal-connect at install time.
 FALLBACK_PLUGIN_ROOT = Path({fallback_root_repr})
 TELEMETRY_REL = Path("hooks") / "cardinal-codex-telemetry.py"
-SEMANTIC_PROMPT_REL = Path("skills") / "semantic-dag" / "scripts" / "hooks" / "prompt_hook.py"
-SEMANTIC_TOOL_REL = Path("skills") / "semantic-dag" / "scripts" / "hooks" / "tool_hook.py"
 
 
 def _version_key(name):
@@ -257,12 +245,6 @@ def _discover_newest_cached(hook_rel):
 def main():
     arguments = sys.argv[1:]
     hook_rel = TELEMETRY_REL
-    if "--semantic-dag-prompt" in arguments:
-        hook_rel = SEMANTIC_PROMPT_REL
-        arguments.remove("--semantic-dag-prompt")
-    elif "--semantic-dag-tool" in arguments:
-        hook_rel = SEMANTIC_TOOL_REL
-        arguments.remove("--semantic-dag-tool")
     fallback_hook = FALLBACK_PLUGIN_ROOT / hook_rel
     hook = fallback_hook if fallback_hook.is_file() else _discover_newest_cached(hook_rel)
     if hook is None:
@@ -300,18 +282,15 @@ def managed_hook_group(event_name: str, timeout: int, status_message: str | None
     }
 
 
-def managed_semantic_hook_group(kind: str, matcher: str = "", async_hook: bool = False) -> dict:
-    hook = {
-        "type": "command",
-        "command": managed_semantic_hook_command(kind),
-        "timeout": 3,
-    }
-    if async_hook:
-        hook["async"] = True
-    return {"matcher": matcher, "hooks": [hook]}
-
-
 def _is_managed_or_legacy_semantic_hook(command: object) -> bool:
+    """Match anything this plugin has ever written into hooks.json.
+
+    The `semantic-dag` clause is now a pure cleanup path: the Semantic
+    DAG skill is gone, but installs connected before its removal still
+    carry prompt/tool hook entries pointing at deleted files. Reconnect
+    (or `--repair-hooks`) strips them here. Do not drop this clause
+    until those versions are unsupported.
+    """
     value = str(command or "")
     return "cardinal-codex-plugin" in value or (
         "semantic-dag" in value
@@ -364,15 +343,6 @@ def write_hooks_config() -> Path | None:
     hooks.setdefault("UserPromptSubmit", []).append(
         managed_hook_group("UserPromptSubmit", 5, "Reporting Cardinal git context")
     )
-    hooks.setdefault("UserPromptSubmit", []).append(
-        managed_semantic_hook_group("prompt")
-    )
-    hooks.setdefault("PreToolUse", []).append(
-        managed_semantic_hook_group("tool", "*", async_hook=True)
-    )
-    hooks.setdefault("PostToolUse", []).append(
-        managed_semantic_hook_group("tool", "*", async_hook=True)
-    )
     hooks.setdefault("Stop", []).append(
         managed_hook_group("Stop", 10, "Reporting Cardinal session telemetry")
     )
@@ -386,17 +356,12 @@ def write_hooks_config() -> Path | None:
 
 
 def repair_hooks(dry_run: bool = False) -> int:
-    """Refresh Semantic DAG hooks without rotating Cardinal credentials."""
-    missing = [
-        path
-        for path in (
-            HOOK_SCRIPT,
-            SEMANTIC_PROMPT_HOOK,
-            SEMANTIC_TOOL_HOOK,
-            SEMANTIC_SESSION_BRIDGE,
-        )
-        if not path.is_file()
-    ]
+    """Rewrite the managed hook config without rotating Cardinal credentials.
+
+    Also the supported way to clear Semantic DAG hook entries left behind
+    by installs that predate the skill's removal.
+    """
+    missing = [path for path in (HOOK_SCRIPT,) if not path.is_file()]
     if missing:
         sys.exit("Required hook script is missing: " + ", ".join(map(str, missing)))
     if dry_run:
@@ -543,14 +508,6 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
 
     if not HOOK_SCRIPT.exists():
         sys.exit(f"Telemetry hook script is missing: {HOOK_SCRIPT}")
-    for semantic_component in (
-        SEMANTIC_PROMPT_HOOK,
-        SEMANTIC_TOOL_HOOK,
-        SEMANTIC_SESSION_BRIDGE,
-    ):
-        if not semantic_component.exists():
-            sys.exit(f"Semantic DAG component is missing: {semantic_component}")
-
     if mcp:
         backup_path = write_codex_config(mcp["url"], mcp["api_key"])
         print(f"Wrote Cardinal MCP config to {CONFIG_PATH}")
