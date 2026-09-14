@@ -18,21 +18,40 @@ import argparse
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _codex_decisions  # noqa: E402
 import _plugin_version  # noqa: E402
-from cardinal_core import bashclass, initiative, limits, otlp, pricing  # noqa: E402
+from cardinal_core import bashclass, decisions, initiative, limits, otlp, pricing  # noqa: E402
 from cardinal_core import session as core_session  # noqa: E402
-from cardinal_core.paths import AgentPaths  # noqa: E402
+from cardinal_core.paths import AgentPaths, read_json  # noqa: E402
 
 
 PLUGIN_VERSION = _plugin_version.plugin_version()
 HOOK_TIMEOUT_SEC = 2.0
 MAX_EVENTS_PER_STOP = 512
+# UserPromptSubmit is synchronous in Codex and its stdout is discarded if
+# the hook times out (hooks.json gives it 5s), so the prompt path never
+# waits on `gh`: it reads the PR cache and refreshes it in a detached child.
+PR_REFRESH_TIMEOUT_SEC = 10.0
+# PostToolUse decision recording does only local work synchronously (argv
+# parse, gate, validation, id, ledger write, reply; PR from cache). D18
+# clusters and the OTLP send run in ONE detached child fed by a 0600 spool
+# file, so a stalled ingest or DNS can never hold the tool result or push
+# the hook past its timeout (which would discard the reply).
+REFRESH_PR_EVENT = "_RefreshPr"
+BACKGROUND_EVENT = "_Background"
+# Tests only: run the spooled job in-process for deterministic assertions.
+BACKGROUND_INLINE_ENV = "CARDINAL_CODEX_BACKGROUND_INLINE"
+# The launcher execs this file from the connected plugin root (or newest
+# cache), so the sibling scripts/ dir is the install the agent should call.
+DECISION_CLI = Path(__file__).resolve().parent.parent / "scripts" / "cardinal-decision"
 
 # P5 capture affordance (subagent-telemetry-enrichment field 4, step 1):
 # Codex's SubagentStop payload shape has never been observed in the wild,
@@ -129,6 +148,230 @@ def dump_debug_payload(event: str, payload: dict[str, Any]) -> None:
         pass
 
 
+def build_decision_context(cli: str, session_id: str, entries: list[dict[str, Any]]) -> str:
+    """Decision-capture instructions + session ledger (Claude parity:
+    adapters/claude/hooks/decision-prompt.py), with Codex's invocation."""
+    command = f"python3 {shlex.quote(cli)} record --session {shlex.quote(session_id)}"
+    return (
+        "Cardinal decision capture is on for this session. When you make a choice that "
+        "constrains later work (picking between approaches, settling an open question, or "
+        "the user deciding something), record it right away with one shell command:\n"
+        f"{command} --choice '<the option chosen, 2-7 words>' "
+        "--question '<what had to be settled>' --why '<one sentence>' "
+        "[--alt '<rejected option>']... [--by user] [--anchor <path>[::Symbol]]... "
+        "[--follows|--refines|--supersedes <id>]\n"
+        "Wrap every value in single quotes so the shell doesn't expand $ or backticks; "
+        "if the hook sees different text than the command printed, it refuses to record.\n"
+        "Record choices, not progress, findings, or tool calls. Use --by user when the user "
+        "made the call. Anchor the files or symbols the decision governs. Link a decision to "
+        "an earlier one when it builds on, narrows, or replaces it.\n"
+        "Decisions so far this session:\n"
+        f"{decisions.render_ledger(entries)}"
+    )
+
+
+def decision_context(paths: AgentPaths, session_id: str) -> str | None:
+    """Context to inject when decision capture is on, else None. File
+    reads only — safe on the synchronous prompt path."""
+    if not decisions.is_enabled(paths.runtime_dir, os.environ.get(decisions.ENABLE_ENV)):
+        return None
+    # The PostToolUse handler is the only emitter. Installs connected
+    # before it existed lack that hook; asking them to record would be a
+    # flow that never fires (cardinal-decision status says how to repair).
+    if not _codex_decisions.post_tool_use_registered(paths):
+        return None
+    entries = decisions.read_ledger(paths.runtime_dir, session_id)
+    return build_decision_context(str(DECISION_CLI), session_id, entries)
+
+
+def merge_prompt_output(gate_out: dict[str, Any] | None, context: str | None) -> dict[str, Any] | None:
+    """Codex parses a hook's stdout as ONE JSON object, so the spend gate
+    and decision context share it. A block verdict wins outright."""
+    out = dict(gate_out or {})
+    if context and out.get("decision") != "block":
+        specific = dict(out.get("hookSpecificOutput") or {"hookEventName": "UserPromptSubmit"})
+        existing = specific.get("additionalContext")
+        specific["additionalContext"] = f"{existing}\n\n{context}" if existing else context
+        out["hookSpecificOutput"] = specific
+    return out or None
+
+
+def cached_pr(
+    paths: AgentPaths, repo: str | None, branch: str | None, now: float | None = None,
+) -> tuple[int | None, str | None, bool]:
+    """(number, url, fresh) from the cache decisions.resolve_pr maintains,
+    without running `gh`. fresh=True also when there is nothing to
+    resolve (no repo/branch, detached HEAD, protected branch)."""
+    if not repo or not branch or branch == "HEAD" or branch in initiative.PROTECTED_BRANCHES:
+        return None, None, True
+    cache = read_json(decisions.cache_dir(paths.runtime_dir) / "prs.json")
+    entry = cache.get(f"{repo}#{branch}")
+    if not isinstance(entry, dict):
+        return None, None, False
+    number = entry.get("number")
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        number = None
+    url = entry.get("url") if number and isinstance(entry.get("url"), str) else None
+    ttl = decisions.PR_CACHE_TTL_SEC if number else decisions.PR_NEGATIVE_TTL_SEC
+    try:
+        age = (time.time() if now is None else now) - float(entry.get("at") or 0)
+    except (TypeError, ValueError):
+        age = float("inf")
+    return number, url, age < ttl
+
+
+def spawn_pr_refresh(cwd: str, repo: str, branch: str) -> None:
+    """Detached `gh` refresh. Own session + devnull stdio: Codex waits for
+    the hook's stdout to close and only kills the process group on
+    timeout (codex-rs/hooks/src/engine/command_runner.rs run_command)."""
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--event", REFRESH_PR_EVENT,
+         "--refresh", json.dumps({"cwd": cwd, "repo": repo, "branch": branch})],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        close_fds=True, start_new_session=True,
+    )
+
+
+def handle_refresh_pr(raw: str | None) -> None:
+    spec = json.loads(raw or "{}")
+    if not isinstance(spec, dict):
+        return
+    decisions.resolve_pr(
+        str(spec.get("cwd") or os.getcwd()), spec.get("repo"), spec.get("branch"),
+        decisions.cache_dir(codex_paths().runtime_dir), timeout=PR_REFRESH_TIMEOUT_SEC,
+    )
+
+
+def cached_pr_lookup(paths: AgentPaths):
+    """PR lookup for the bounded decision path: cache only, detached
+    refresh on a miss/stale entry (same as the prompt path)."""
+
+    def lookup(cwd: str, repo: str | None, branch: str | None) -> tuple[int | None, str | None]:
+        number, url, fresh = cached_pr(paths, repo, branch)
+        if not fresh:
+            try:
+                spawn_pr_refresh(cwd, repo, branch)
+            except Exception:
+                pass
+        return number, url
+
+    return lookup
+
+
+def spawn_background(job: dict[str, Any]) -> bool:
+    """Spool `job` (0600, O_EXCL) and run it in a detached child with
+    /dev/null stdio and its own session (Codex waits for the hook's stdout
+    to close and kills the process group only on timeout). Same pattern as
+    the Gemini adapter. False when the job could not be queued."""
+    try:
+        spool_dir = codex_paths().runtime_dir / "spool"
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        path = spool_dir / f"{job.get('kind')}-{os.getpid()}-{time.time_ns()}.json"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(job, fh, default=str)
+    except (OSError, TypeError, ValueError):
+        return False
+    if os.environ.get(BACKGROUND_INLINE_ENV) == "1":
+        run_background_job(path)
+        return True
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--event", BACKGROUND_EVENT,
+             "--background", str(path)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True,
+        )
+    except OSError:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def run_background_job(path: Path) -> None:
+    try:
+        job = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    if isinstance(job, dict) and job.get("kind") == "decisions":
+        entries = job.get("entries")
+        if isinstance(entries, list) and entries:
+            _codex_decisions.emit_entries(codex_paths(), entries, PLUGIN_VERSION)
+
+
+def record_decisions(payload: dict[str, Any], specs: list[dict[str, Any]],
+                     reasons: list[str]) -> list[str]:
+    """Synchronous local half; returns the lines reported to the agent."""
+    paths = codex_paths()
+    if not decisions.is_enabled(paths.runtime_dir, os.environ.get(decisions.ENABLE_ENV)):
+        return [_codex_decisions.CAPTURE_OFF_REPORT]
+    reports = list(reasons)
+    if not specs:
+        return reports
+    # The session Codex observed — never the marker's self-reported one.
+    session_id = session_id_from_payload(payload)
+    if not session_id:
+        return reports + ["Cardinal did NOT record the decision: the hook payload had no session id."]
+    payload_cwd = str(payload.get("cwd") or os.getcwd())
+    lookup = cached_pr_lookup(paths)
+    connected = otlp.connection_from_paths(paths) is not None
+    entries: list[dict[str, Any]] = []
+    recorded: list[str] = []
+    for spec in specs:
+        if not os.path.isdir(spec["cwd"]):
+            spec = dict(spec, cwd=payload_cwd)
+        try:
+            entry = _codex_decisions.record_local(paths, spec, session_id, lookup)
+        except decisions.DecisionError as err:
+            reports.append(f"Cardinal did NOT record decision {spec['choice']!r}: {err}")
+            continue
+        except Exception as err:
+            reports.append(f"Cardinal did NOT record decision {spec['choice']!r} "
+                           f"({type(err).__name__}: {err}).")
+            continue
+        entries.append(entry)
+        recorded.append(_codex_decisions.report_line(entry, connected))
+    if entries and connected and not spawn_background({"kind": "decisions", "entries": entries}):
+        recorded.append("Warning: the decisions above were saved locally but Cardinal could not "
+                        "queue sending them.")
+    return recorded + reports
+
+
+def handle_post_tool_use(payload: dict[str, Any]) -> None:
+    """Hook-side decision recording — the only cardinal.decision emitter.
+    Silent for every tool call that doesn't run `cardinal-decision record`;
+    once one does, always replies (recorded, or NOT recorded and why)."""
+    try:
+        specs, reasons = _codex_decisions.plan_post_tool_use(payload)
+    except Exception as err:
+        specs, reasons = [], [f"Cardinal did NOT record the decision ({type(err).__name__}: {err})."]
+    if not specs and not reasons:
+        return
+    try:
+        reports = record_decisions(payload, specs, reasons)
+    except Exception as err:  # never fail silently once an invocation was seen
+        reports = reasons + [f"Cardinal did NOT record the decision ({type(err).__name__}: {err})."]
+    if not reports:
+        return
+    # PostToolUse accepts hookSpecificOutput.additionalContext
+    # (codex-rs/hooks/schema/generated/post-tool-use.command.output.schema.json).
+    sys.stdout.write(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": "\n\n".join(reports),
+        }
+    }))
+    sys.stdout.flush()
+
+
 def handle_user_prompt_submit(payload: dict[str, Any]) -> None:
     session_id = session_id_from_payload(payload)
     if not session_id:
@@ -138,12 +381,22 @@ def handle_user_prompt_submit(payload: dict[str, Any]) -> None:
 
     # Sync gate FIRST — its stdout is the hook's verdict channel and must
     # not wait on any network call below.
+    gate_out = None
     try:
         gate_out = limits.gate_output(
             paths, session_id, hook_event_name="UserPromptSubmit"
         )
-        if gate_out:
-            sys.stdout.write(json.dumps(gate_out))
+    except Exception:
+        pass
+    context = None
+    try:
+        context = decision_context(paths, session_id)
+    except Exception:
+        pass
+    try:
+        prompt_out = merge_prompt_output(gate_out, context)
+        if prompt_out:
+            sys.stdout.write(json.dumps(prompt_out))
             sys.stdout.flush()
     except Exception:
         pass
@@ -158,6 +411,16 @@ def handle_user_prompt_submit(payload: dict[str, Any]) -> None:
     remote_url = initiative.git(["remote", "get-url", "origin"], cwd)
     repo = initiative.canonical_repo(remote_url)
     initiative_name, initiative_type = initiative.resolve_initiative(branch)
+    pr_number = pr_url = None
+    try:
+        # Cache-only on the sync path; a miss or stale entry is refreshed
+        # by a detached child, so the first prompt on a new branch may
+        # lack the PR keys. Unresolved → both keys dropped by log_record.
+        pr_number, pr_url, fresh = cached_pr(paths, repo, branch)
+        if not fresh:
+            spawn_pr_refresh(cwd, repo, branch)
+    except Exception:
+        pass
     attrs: dict[str, Any] = {
         "session_id": session_id,
         "cardinal_cwd": cwd,
@@ -165,6 +428,8 @@ def handle_user_prompt_submit(payload: dict[str, Any]) -> None:
         "cardinal_branch": branch,
         "cardinal_repo": repo,
         "cardinal_remote_url": remote_url,
+        "cardinal_pr_number": pr_number,
+        "cardinal_pr_url": pr_url,
         "cardinal_initiative_name": initiative_name,
         "cardinal_initiative_type": initiative_type,
         "cardinal_command": initiative.detect_command(
@@ -715,7 +980,24 @@ def handle_subagent_stop(payload: dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--event", required=True)
+    parser.add_argument("--refresh", help=argparse.SUPPRESS)
+    parser.add_argument("--background", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.event == BACKGROUND_EVENT:
+        try:
+            if args.background:
+                run_background_job(Path(args.background))
+        except Exception:
+            pass
+        silent_exit()
+
+    if args.event == REFRESH_PR_EVENT:
+        try:
+            handle_refresh_pr(args.refresh)
+        except Exception:
+            pass
+        silent_exit()
 
     raw = sys.stdin.read()
     try:
@@ -734,6 +1016,8 @@ def main() -> None:
             handle_stop(payload)
         elif args.event == "SubagentStop":
             handle_subagent_stop(payload)
+        elif args.event == "PostToolUse":
+            handle_post_tool_use(payload)
     except Exception:
         pass
     silent_exit()
