@@ -349,6 +349,14 @@ def write_hooks_config() -> Path | None:
     hooks.setdefault("SubagentStop", []).append(
         managed_hook_group("SubagentStop", 5, "Reporting Cardinal subagent telemetry")
     )
+    # Hook-side cardinal.decision emission: the agent's sandboxed
+    # `cardinal-decision record` only prints a marker. Exact matcher "Bash"
+    # (Codex's hook name for exec_command); the handler exits at once
+    # unless the command ran cardinal-decision. No statusMessage — it would
+    # flash on every shell call.
+    post_tool_use = managed_hook_group("PostToolUse", 10)
+    post_tool_use["matcher"] = "Bash"
+    hooks.setdefault("PostToolUse", []).append(post_tool_use)
     HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
     backup_path = backup(HOOKS_PATH)
     atomic_write(HOOKS_PATH, json.dumps(data, indent=2) + "\n")
