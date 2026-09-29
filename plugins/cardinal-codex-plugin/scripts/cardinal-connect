@@ -357,6 +357,17 @@ def write_hooks_config() -> Path | None:
     post_tool_use = managed_hook_group("PostToolUse", 10)
     post_tool_use["matcher"] = "Bash"
     hooks.setdefault("PostToolUse", []).append(post_tool_use)
+    # Generic evidence capture: every tool call (shell, apply_patch, MCP,
+    # any tool) is kept in the local evidence spool so a storyboard can cite
+    # it. A separate group so the decision emitter above is untouched; ".*"
+    # is a regex matcher (hooks/src/events/common.rs matches_matcher: only an
+    # alphanumeric matcher is an exact match). Local file work, no network.
+    evidence_group = {"matcher": ".*", "hooks": [{
+        "type": "command",
+        "command": managed_hook_command("ToolEvidence"),
+        "timeout": 3,
+    }]}
+    hooks["PostToolUse"].append(evidence_group)
     HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
     backup_path = backup(HOOKS_PATH)
     atomic_write(HOOKS_PATH, json.dumps(data, indent=2) + "\n")
@@ -439,6 +450,10 @@ def write_state(bundle: dict, host: str, deployment_env: str, telemetry_only: bo
             "enabled": bool(ingest),
         },
     }
+    reason = deviceflow.ingest_unavailable_reason(bundle)
+    if reason:
+        # Why the server minted no ingest key, so cardinal-status can say so.
+        state["telemetry"]["unavailable_reason"] = reason
     if ingest:
         state["ingest_endpoint"] = ingest.get("endpoint")
         state["ingest_key_id"] = ingest.get("key_id")
@@ -476,8 +491,17 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
     ingest = bundle.get("ingest")
     mcp = bundle.get("mcp")
 
-    if not ingest:
-        sys.exit("Cardinal did not return an ingest credential. Check the requested scopes.")
+    # Set when the server granted the other scopes but minted no ingest key
+    # (org has no Lakerunner, or no ingest endpoint configured). Connect goes
+    # on without telemetry as long as there is an MCP credential to wire.
+    ingest_reason = deviceflow.ingest_unavailable_reason(bundle)
+
+    if not ingest and not mcp:
+        sys.exit(
+            "Cardinal did not return an ingest credential "
+            f"({deviceflow.ingest_unavailable_note(ingest_reason or 'unknown', mcp_connected=False)}). "
+            "Nothing to connect."
+        )
     if not args.telemetry_only and not mcp:
         sys.exit("Cardinal did not return an MCP credential. Check the requested scopes.")
 
@@ -495,7 +519,8 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
                     "telemetry_launcher": str(LAUNCHER_PATH),
                     "state": str(STATE_PATH),
                     "secrets": str(SECRETS_PATH),
-                    "ingest_endpoint": ingest.get("endpoint"),
+                    "ingest_endpoint": (ingest or {}).get("endpoint"),
+                    "ingest_unavailable_reason": ingest_reason,
                     "mcp_url": (mcp or {}).get("url"),
                 },
             },
@@ -503,10 +528,13 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
         ))
         return 0
 
-    ok, msg = deviceflow.verify_ingest_reachable(ingest)
-    if not ok:
-        sys.exit(f"Ingest reachability failed: {msg}")
-    print(f"Ingest endpoint reachable ({msg})")
+    # No ingest credential: nothing to probe, and no telemetry config to
+    # write — skip rather than abort so the MCP config still gets written.
+    if ingest:
+        ok, msg = deviceflow.verify_ingest_reachable(ingest)
+        if not ok:
+            sys.exit(f"Ingest reachability failed: {msg}")
+        print(f"Ingest endpoint reachable ({msg})")
 
     if mcp:
         ok, msg = deviceflow.verify_mcp_reachable(mcp.get("url"), mcp.get("api_key"))
@@ -538,7 +566,11 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
 
     print()
     print(f"Connected as {user.get('email') or 'unknown'} ({org.get('slug') or org.get('id')})")
-    print(f"Telemetry endpoint: {ingest['endpoint']}")
+    if ingest:
+        print(f"Telemetry endpoint: {ingest['endpoint']}")
+    else:
+        print(f"WARN {deviceflow.ingest_unavailable_note(ingest_reason or 'unknown', mcp_connected=bool(mcp))}")
+        print("     Re-run cardinal-connect --rotate once telemetry ingest is available.")
     if mcp:
         print(f"MCP endpoint: {mcp['url']}")
     print()
