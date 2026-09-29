@@ -372,6 +372,90 @@ def handle_post_tool_use(payload: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+# ---------------------------------------------------------------------------
+# Evidence capture (PostToolUse, every tool) — the Codex side of the generic
+# evidence pipeline (cardinal_core.evidence_capture.capture_call).
+# cardinal-connect registers a second PostToolUse group, matcher ".*", that
+# runs this file with `--event ToolEvidence`; the "Bash" group above stays
+# the decision emitter. Codex names MCP tools mcp__<server>__<tool>
+# (normalize_tool_name); Cardinal's own `cardinal` server is skipped, its
+# gateway already mints witnessed receipts.
+# ---------------------------------------------------------------------------
+
+CARDINAL_MCP_SERVERS = ("cardinal",)
+EVIDENCE_CLI = Path(__file__).resolve().parent.parent / "scripts" / "cardinal-evidence"
+EVIDENCE_EVENT = "ToolEvidence"
+
+
+def codex_version() -> str | None:
+    """The Codex CLI version, when the environment names it (no process is
+    spawned in a hook)."""
+    for key in ("CODEX_VERSION", "CODEX_CLI_VERSION"):
+        v = os.environ.get(key)
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
+def evidence_call(payload: dict[str, Any]):
+    """A ToolCall for any PostToolUse payload, or None without a tool
+    name. Codex's documented shape (unified_exec PostToolUseRequest):
+    {session_id, turn_id, cwd, tool_name, tool_input, tool_response,
+    tool_use_id}; tool_response is the command output string for Bash."""
+    from cardinal_core import evidence, evidence_capture as cap
+
+    raw_name = payload.get("tool_name") or payload.get("toolName")
+    if not isinstance(raw_name, str) or not raw_name:
+        return None
+    source, tool = cap.classify_mcp_name(raw_name, "codex", CARDINAL_MCP_SERVERS)
+    tuid = payload.get("tool_use_id") or payload.get("toolUseId") or payload.get("call_id")
+    cwd = payload.get("cwd")
+    response = payload.get("tool_response")
+    if response is None:
+        response = payload.get("toolResponse")
+    error = payload.get("error")
+    return cap.ToolCall(
+        runtime="codex",
+        tool_name=raw_name,
+        source=source,
+        tool=tool,
+        tool_input=payload.get("tool_input") if "tool_input" in payload else payload.get("toolInput"),
+        response=response,
+        error=error if isinstance(error, str) and error.strip() else None,
+        session_id=session_id_from_payload(payload),
+        tool_use_id=tuid if isinstance(tuid, str) else None,
+        cwd=cwd if isinstance(cwd, str) else None,
+        client=evidence.client_string("codex", codex_version()),
+    )
+
+
+def handle_tool_evidence(payload: dict[str, Any]) -> None:
+    """Record one tool call (any tool) in the local evidence spool and hand
+    the agent its `[evidence:ev_...]` id as PostToolUse
+    hookSpecificOutput.additionalContext. Local file work only."""
+    dump_debug_payload("PostToolUse", payload)
+    try:
+        from cardinal_core import evidence_capture as cap
+
+        call = evidence_call(payload)
+        if call is None:
+            return
+        # Never silent: a call the pipeline cannot finish in time is kept as a
+        # withheld stub (capture_call_guarded).
+        got = cap.capture_call_guarded(call, Path.home(), promote_cmd=shlex.quote(str(EVIDENCE_CLI)))
+    except BaseException:
+        return
+    if got is None or not got.line:
+        return
+    sys.stdout.write(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": got.line,
+        }
+    }))
+    sys.stdout.flush()
+
+
 def handle_user_prompt_submit(payload: dict[str, Any]) -> None:
     session_id = session_id_from_payload(payload)
     if not session_id:
@@ -1018,6 +1102,8 @@ def main() -> None:
             handle_subagent_stop(payload)
         elif args.event == "PostToolUse":
             handle_post_tool_use(payload)
+        elif args.event == EVIDENCE_EVENT:
+            handle_tool_evidence(payload)
     except Exception:
         pass
     silent_exit()

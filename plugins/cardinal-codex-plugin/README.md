@@ -196,6 +196,31 @@ Unverified or limits:
 - Worst-case `UserPromptSubmit` time is now git + git_state POST (2s) +
   limits refresh (2s), under the 5s timeout but not by much.
 
+## Evidence capture (storyboards)
+
+`cardinal-connect` registers a second `PostToolUse` group (matcher `.*`,
+`--event ToolEvidence`) next to the decision emitter. It records every tool
+call Codex reports to `PostToolUse` in the local evidence spool shared with
+the other Cardinal adapters, `~/.cardinal/evidence/<session>/ev_<id>.json`,
+through the shared generic pipeline (`cardinal_core.evidence_capture`): a
+call that touches something sensitive (a `.env` or key file, `printenv`,
+`gh auth token`, a credentialed URL or header) is kept only as a *withheld*
+stub; everything else is scrubbed, capped at 256 KiB and removed after 14
+days. The id comes back as `hookSpecificOutput.additionalContext`
+(`[evidence:ev_…]`). Nothing leaves the machine: `scripts/cardinal-evidence
+promote --storyboard sb_… ev_…` uploads only what a storyboard cites, with
+the connection's MCP key, and needs the network (approve it outside the
+sandbox). Run `cardinal-connect --repair-hooks` and restart Codex to pick up
+the new group.
+
+Verified: `PostToolUse` fires for `Bash` with `tool_response` = the output
+string (see Host-surface evidence). Not verified: whether Codex fires
+`PostToolUse` for MCP tools and `apply_patch`, and that `.*` matches every
+tool name (`matches_matcher` treats a non-alphanumeric matcher as a regex;
+the pre-removal Semantic DAG hooks used `.*`). Tool calls that do not reach
+`PostToolUse` are not captured; cite them with `storyboard__record_evidence`
+(the reported tier). `CARDINAL_CODEX_DEBUG_PAYLOADS=1` dumps real payloads.
+
 ## Tests
 
 ```bash
