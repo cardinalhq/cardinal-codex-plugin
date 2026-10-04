@@ -444,13 +444,123 @@ def handle_tool_evidence(payload: dict[str, Any]) -> None:
         # withheld stub (capture_call_guarded).
         got = cap.capture_call_guarded(call, Path.home(), promote_cmd=shlex.quote(str(EVIDENCE_CLI)))
     except BaseException:
-        return
+        got = None
+    record_patch_edits(payload)
     if got is None or not got.line:
         return
     sys.stdout.write(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
             "additionalContext": got.line,
+        }
+    }))
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Storyboard associations (cardinal_core.storyboard_agent): the session id +
+# discovery block at SessionStart, the files apply_patch edited (recorded by
+# the ToolEvidence PostToolUse run above: no new hook process), and context
+# stamping on Cardinal's storyboard tools (PreToolUse, `--event
+# StoryboardContext`). Payload shapes captured from codex-cli 0.142.5
+# (tests/test_codex_storyboard.py fixtures).
+# ---------------------------------------------------------------------------
+
+STORYBOARD_CLI = Path(__file__).resolve().parent.parent / "scripts" / "cardinal-storyboard"
+STORYBOARD_CONTEXT_EVENT = "StoryboardContext"
+# The four tools stamped_input fills (link's about refs are the model's);
+# the same set as cardinal-connect's PreToolUse matcher.
+STORYBOARD_TOOL_RE = re.compile(r"^mcp__cardinal__storyboard__(create|add_act|publish|find)$")
+# hooks.json's handler for the stamping hook (cardinal-connect
+# managed_hook_command("StoryboardContext")).
+STORYBOARD_CONTEXT_HOOK_NEEDLE = f"--event {STORYBOARD_CONTEXT_EVENT} # cardinal-codex-plugin"
+# Codex applies a PreToolUse updatedInput only together with
+# permissionDecision "allow" ("PreToolUse hook returned updatedInput without
+# permissionDecision:allow"), and whether that "allow" also skips an approval
+# prompt Codex would otherwise show is not verified. So the hook stamps only
+# where no prompt exists (bypassPermissions), or everywhere when the user sets
+# CARDINAL_STORYBOARD_CONTEXT=always; elsewhere `cardinal-storyboard context`
+# (named at SessionStart) is how the context gets there.
+STAMP_PERMISSION_MODES = ("bypassPermissions",)
+STAMP_ALWAYS_VALUES = ("always", "allow")
+
+
+def storyboard_wiring():
+    from cardinal_core import storyboard_agent
+
+    return storyboard_agent.Wiring("codex", codex_paths(), PLUGIN_VERSION, cli=str(STORYBOARD_CLI))
+
+
+def stamping_allowed(payload: dict[str, Any]) -> bool:
+    value = os.environ.get("CARDINAL_STORYBOARD_CONTEXT")
+    if isinstance(value, str) and value.strip().lower() in STAMP_ALWAYS_VALUES:
+        return True
+    return payload.get("permission_mode") in STAMP_PERMISSION_MODES
+
+
+def stamping_registered() -> bool:
+    """Whether ~/.codex/hooks.json has the PreToolUse StoryboardContext
+    handler. The stable launcher runs the newest cached plugin's hook, so
+    after an upgrade this code runs before `cardinal-connect --repair-hooks`
+    has added the handler."""
+    from cardinal_core import storyboard_agent
+
+    return storyboard_agent.hooks_file_registers(Path.home() / ".codex" / "hooks.json", "PreToolUse",
+                                                 STORYBOARD_CONTEXT_HOOK_NEEDLE)
+
+
+def auto_context(payload: dict[str, Any], wiring) -> bool:
+    """Whether the PreToolUse hook will fill an absent session_id / context
+    in this session: allowed in this permission mode, not turned off with
+    CARDINAL_STORYBOARD_CONTEXT=0, and actually registered. Chosen from the
+    SessionStart permission_mode; a mid-session /approvals change is not
+    seen (the CLI fallback is named in both wordings)."""
+    return stamping_allowed(payload) and not wiring.context_disabled() and stamping_registered()
+
+
+def record_patch_edits(payload: dict[str, Any]) -> None:
+    """The files a successful apply_patch named, into storyboard_files
+    (`context.paths`). Local only; never raises."""
+    try:
+        name = payload.get("tool_name") or payload.get("toolName")
+        if name not in ("apply_patch", "functions.apply_patch"):
+            return
+        from cardinal_core import storyboard_agent
+
+        response = payload.get("tool_response")
+        if response is None:
+            response = payload.get("toolResponse")
+        if not storyboard_agent.apply_patch_succeeded(response):
+            return
+        tool_input = payload.get("tool_input") if "tool_input" in payload else payload.get("toolInput")
+        cwd = payload.get("cwd")
+        storyboard_agent.record_edits(storyboard_wiring(), session_id_from_payload(payload),
+                                      storyboard_agent.apply_patch_paths(tool_input),
+                                      cwd if isinstance(cwd, str) else None)
+    except Exception:
+        pass
+
+
+def handle_storyboard_context(payload: dict[str, Any]) -> None:
+    """PreToolUse on mcp__cardinal__storyboard__*: fill an absent
+    session_id / context (storyboard_agent.stamped_input). Prints nothing
+    (the call runs unchanged) when nothing was added, when stamping is not
+    allowed in this permission mode, or on any failure."""
+    dump_debug_payload("PreToolUse", payload)
+    m = STORYBOARD_TOOL_RE.match(str(payload.get("tool_name") or ""))
+    if not m or not stamping_allowed(payload):
+        return
+    from cardinal_core import storyboard_agent
+
+    out = storyboard_agent.stamped_input(storyboard_wiring(), m.group(1), payload.get("tool_input"),
+                                         session_id_from_payload(payload), payload.get("cwd"))
+    if out is None:
+        return
+    sys.stdout.write(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": out,
         }
     }))
     sys.stdout.flush()
@@ -982,22 +1092,41 @@ def handle_stop(payload: dict[str, Any]) -> None:
 
 
 def handle_session_start(payload: dict[str, Any]) -> None:
+    started = time.monotonic()
     cwd = str(payload.get("cwd") or os.getcwd())
-    if not initiative.is_git_repo(cwd):
-        # Outside a git repo there's no branch to advise on; suppress the
-        # prompt to avoid wasted context.
-        return
-    context = core_session.convention_prompt("Codex")
+    parts: list[str] = []
+    # Outside a git repo there's no branch to advise on; the convention
+    # prompt is suppressed to avoid wasted context.
+    if initiative.is_git_repo(cwd):
+        context = core_session.convention_prompt("Codex")
+        try:
+            standing = core_session.budget_standing(
+                codex_paths(), session_id_from_payload(payload), cwd
+            )
+            if standing:
+                context = f"{context}\n\n{standing}"
+        except Exception:
+            # Budget standing is additive — never let it cost the convention
+            # prompt (or session start).
+            pass
+        parts.append(context)
     try:
-        standing = core_session.budget_standing(
-            codex_paths(), session_id_from_payload(payload), cwd
-        )
-        if standing:
-            context = f"{context}\n\n{standing}"
+        # The session id line (any directory: an incident storyboard needs no
+        # repo) + the storyboards that may relate to this checkout. Bounded
+        # well inside hooks.json's 5 s.
+        from cardinal_core import storyboard_agent
+
+        wiring = storyboard_wiring()
+        storyboard = storyboard_agent.session_start_text(
+            wiring, cwd, session_id_from_payload(payload),
+            auto_context=auto_context(payload, wiring), deadline=min(started + 3.5, time.monotonic() + 2.0))
+        if storyboard:
+            parts.append(storyboard)
     except Exception:
-        # Budget standing is additive — never let it cost the convention
-        # prompt (or session start).
         pass
+    if not parts:
+        return
+    context = "\n\n".join(parts)
     sys.stdout.write(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -1104,6 +1233,8 @@ def main() -> None:
             handle_post_tool_use(payload)
         elif args.event == EVIDENCE_EVENT:
             handle_tool_evidence(payload)
+        elif args.event == STORYBOARD_CONTEXT_EVENT:
+            handle_storyboard_context(payload)
     except Exception:
         pass
     silent_exit()

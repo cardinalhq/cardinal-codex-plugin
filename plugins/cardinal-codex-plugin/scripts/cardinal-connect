@@ -175,6 +175,9 @@ def load_json_object(path: Path, label: str) -> dict:
     return data
 
 
+STORYBOARD_CONTEXT_MATCHER = "^mcp__cardinal__storyboard__(create|add_act|publish|find)$"
+
+
 def managed_hook_command(event_name: str) -> str:
     return (
         f"python3 {shlex.quote(str(LAUNCHER_PATH))} "
@@ -368,6 +371,18 @@ def write_hooks_config() -> Path | None:
         "timeout": 3,
     }]}
     hooks["PostToolUse"].append(evidence_group)
+    # Storyboard context stamping: fills an absent session_id / context on
+    # Cardinal's storyboard tools (hooks/cardinal-codex-telemetry.py
+    # handle_storyboard_context). A regex matcher: only those calls start
+    # the hook. Local git + a gh lookup capped at 2 s.
+    hooks.setdefault("PreToolUse", []).append({
+        "matcher": STORYBOARD_CONTEXT_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": managed_hook_command("StoryboardContext"),
+            "timeout": 5,
+        }],
+    })
     HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
     backup_path = backup(HOOKS_PATH)
     atomic_write(HOOKS_PATH, json.dumps(data, indent=2) + "\n")
