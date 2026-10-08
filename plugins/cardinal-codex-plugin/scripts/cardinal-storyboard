@@ -40,5 +40,12 @@ if __name__ == "__main__":
             sys.stdout.write('{"context":{}}\n')
         sys.exit(0)
 
+    if sys.argv[1:2] == ["investigation"]:
+        from cardinal_core import investigation_agent
+        from cardinal_core.paths import AgentPaths
+        wiring = storyboard_agent.Wiring("codex", AgentPaths(home=Path.home() / ".codex"),
+                                          plugin_version(), cli=str(Path(__file__).resolve()))
+        sys.exit(investigation_agent.cli_main(sys.argv[2:], wiring, SESSION_ENV))
+
     storyboard_agent.launcher_main("codex", "Codex", ".codex", plugin_version,
                                    str(Path(__file__).resolve()), SESSION_ENV)

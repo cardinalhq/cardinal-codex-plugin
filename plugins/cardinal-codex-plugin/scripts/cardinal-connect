@@ -341,7 +341,7 @@ def write_hooks_config() -> Path | None:
     data = strip_managed_hooks(load_json_object(HOOKS_PATH, "hooks.json"))
     hooks = data.setdefault("hooks", {})
     hooks.setdefault("SessionStart", []).append(
-        managed_hook_group("SessionStart", 5, "Loading Cardinal session context")
+        managed_hook_group("SessionStart", 8, "Loading Cardinal session context")
     )
     hooks.setdefault("UserPromptSubmit", []).append(
         managed_hook_group("UserPromptSubmit", 5, "Reporting Cardinal git context")
