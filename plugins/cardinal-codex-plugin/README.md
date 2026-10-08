@@ -221,6 +221,36 @@ the pre-removal Semantic DAG hooks used `.*`). Tool calls that do not reach
 `PostToolUse` are not captured; cite them with `storyboard__record_evidence`
 (the reported tier). `CARDINAL_CODEX_DEBUG_PAYLOADS=1` dumps real payloads.
 
+## Automatic Investigation Storyboards
+
+Every connected Codex session now creates or reuses one private Investigation
+and Storyboard at SessionStart. The hook tells Codex to show its link in the
+first progress update, set the investigation question, and checkpoint material
+findings with captured or witnessed evidence as the work proceeds. When the
+server advertises projection, its projector updates that draft automatically;
+the worker does not create another Storyboard or author scenes. Publication and
+sharing remain explicit. No transcript or owner-input payload is supplied.
+
+`scripts/cardinal-storyboard investigation link|question|checkpoint|events|ack
+--session SID` uses the shared Investigation transport, evidence promotion,
+validation and idempotency. `checkpoint --help` lists the event types and fields;
+checkpoint input is a JSON array on stdin. The session id is passed explicitly.
+A session joined to another author's Investigation cannot checkpoint or frame it.
+A shell holding `CARDINAL_INVESTIGATION_TOKEN` cannot use this author CLI.
+
+A detached, per-session poller retries transient bootstrap failures, refreshes
+capabilities and fetches advisory events. PostToolUse delivers its local inbox
+without network waits. Polling pauses while idle and exits with its Codex
+ancestor. Advisories retain their untrusted authority. Owner-input capture is
+not wired in the Codex adapter. `CARDINAL_STORYBOARD_SESSION_START=0` disables
+automatic bootstrap/guidance; `CARDINAL_INVESTIGATION_POLLER=0` disables polling.
+
+Upgrade the plugin, run `scripts/cardinal-connect --repair-hooks`, and review and
+trust the updated Cardinal hooks in Codex. Start a new session to pick them up.
+SessionStart has an eight-second budget for existing context plus the bounded
+bootstrap request. Older servers without bootstrap retain discovery behavior;
+servers without projection are described honestly as not automatically updating.
+
 ## Storyboard associations
 
 Where a storyboard is written from (repo, branch, PR, HEAD, the files this

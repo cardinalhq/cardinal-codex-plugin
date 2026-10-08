@@ -446,12 +446,21 @@ def handle_tool_evidence(payload: dict[str, Any]) -> None:
     except BaseException:
         got = None
     record_patch_edits(payload)
-    if got is None or not got.line:
+    lines = [got.line] if got is not None and got.line else []
+    try:
+        from cardinal_core import investigation_agent
+        wiring = storyboard_wiring()
+        sid = session_id_from_payload(payload)
+        investigation_agent.spawn_poller(wiring, sid, str(INVESTIGATION_POLLER))
+        investigation_agent.deliver(wiring, sid, lines.append)
+    except Exception:
+        pass
+    if not lines:
         return
     sys.stdout.write(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": got.line,
+            "additionalContext": "\n\n".join(lines),
         }
     }))
     sys.stdout.flush()
@@ -467,6 +476,7 @@ def handle_tool_evidence(payload: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 STORYBOARD_CLI = Path(__file__).resolve().parent.parent / "scripts" / "cardinal-storyboard"
+INVESTIGATION_POLLER = Path(__file__).resolve().parent / "investigation-poller.py"
 STORYBOARD_CONTEXT_EVENT = "StoryboardContext"
 # The four tools stamped_input fills (link's about refs are the model's);
 # the same set as cardinal-connect's PreToolUse matcher.
@@ -588,6 +598,14 @@ def handle_user_prompt_submit(payload: dict[str, Any]) -> None:
     except Exception:
         pass
     try:
+        from cardinal_core import investigation_agent, investigation_events
+        wiring = storyboard_wiring()
+        binding = investigation_events.read_binding(Path.home(), session_id)
+        if (investigation_agent.enabled(wiring) and binding
+                and binding.get("org") == wiring.connection().get("org")
+                and binding.get("bootstrap", {}).get("status") == "ok"):
+            live = investigation_agent.describe(wiring, session_id, binding)
+            context = "\n\n".join(x for x in (context, live) if x)
         prompt_out = merge_prompt_output(gate_out, context)
         if prompt_out:
             sys.stdout.write(json.dumps(prompt_out))
@@ -1113,13 +1131,18 @@ def handle_session_start(payload: dict[str, Any]) -> None:
     try:
         # The session id line (any directory: an incident storyboard needs no
         # repo) + the storyboards that may relate to this checkout. Bounded
-        # well inside hooks.json's 5 s.
+        # bounded alongside bootstrap within hooks.json's 8 s.
         from cardinal_core import storyboard_agent
 
         wiring = storyboard_wiring()
-        storyboard = storyboard_agent.session_start_text(
-            wiring, cwd, session_id_from_payload(payload),
-            auto_context=auto_context(payload, wiring), deadline=min(started + 3.5, time.monotonic() + 2.0))
+        from cardinal_core import investigation_agent
+        sid = session_id_from_payload(payload)
+        live = investigation_agent.start(wiring, sid, payload.get("source"))
+        investigation_agent.spawn_poller(wiring, sid, str(INVESTIGATION_POLLER))
+        discovery = storyboard_agent.session_start_text(
+            wiring, cwd, sid, include_session_line=not bool(live),
+            auto_context=auto_context(payload, wiring), deadline=min(started + 6.5, time.monotonic() + 1.5))
+        storyboard = "\n\n".join(text for text in (live, discovery) if text)
         if storyboard:
             parts.append(storyboard)
     except Exception:
