@@ -1,6 +1,6 @@
 """Automatic Investigation sessions for adapters using storyboard_agent.Wiring.
 
-The server owns projection. This adapter only bootstraps the session, describes
+The session owns visualization authoring after user consent. This adapter bootstraps the session, describes
 its capabilities, and submits explicit semantic checkpoints with cited evidence.
 No transcript or user prompt is read or uploaded here.
 """
@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from .storyboard_offer import VISUALIZATION_OFFER
 from . import investigation_bootstrap as boot
 from . import investigation_events as ie
 from . import investigation_grants as grants
@@ -44,11 +45,8 @@ def describe(wiring, sid: str, binding: dict) -> str:
               f"and private Storyboard {facts['storyboard_id']}. {links} ")
     if not facts["is_author"]:
         return prefix + "You joined another author's investigation. Do not checkpoint, frame, or edit it."
-    projection = ("Cardinal automatically projects your cited checkpoints into this same private Storyboard. "
-                  "Do not create another storyboard or manually author its scenes. "
-                  if boot.capability_enabled(facts["capabilities"], boot.PROJECTION) else
-                  "Automatic projection is unavailable on this connection; do not claim the draft is updating. ")
-    return (prefix + projection +
+    return (prefix + "The storyboard visualization is authored in this session, only when the user asks or accepts your offer. " +
+            "Do not create another storyboard for this session. " + VISUALIZATION_OFFER + " " +
             "Show the user the Storyboard link in your first progress update so they can follow the work. "
             "Publishing and sharing require the user's explicit request. "
             f"Use `{cmd} link {target}` to recover its link. "
