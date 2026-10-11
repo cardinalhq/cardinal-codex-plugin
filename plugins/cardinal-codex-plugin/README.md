@@ -77,6 +77,17 @@ SessionStart injects the initiative branch-naming convention plus the
 session's spend-budget standing; the per-prompt spend-limits gate reads the
 locally cached verdict (file I/O only) and fails open.
 
+Automatic session storyboards carry the checkout's repository, branch, HEAD,
+relative directory, and client labels. SessionStart uses the hook payload's
+working directory and cached PR information; it never sends an absolute path
+or runs a network PR lookup. The first repository snapshot is retained for
+bootstrap retries and background refresh, so a later directory change cannot
+retag the storyboard. Resuming an older session can fill missing repo tags on
+its own draft after Maestro supports session context. Existing tags and
+published acts are preserved. `CARDINAL_STORYBOARD_CONTEXT=0` disables this
+collection and clears the saved snapshot. Older Maestro servers still create
+the session normally, without repo tags, until upgraded.
+
 State lives under `~/.codex/cardinal/` (telemetry progress cursors, plan
 stamp, limits verdicts, decision setting + ledgers); `cardinal-disconnect`
 removes it.
