@@ -1157,7 +1157,7 @@ def handle_session_start(payload: dict[str, Any]) -> None:
         wiring = storyboard_wiring()
         from cardinal_core import investigation_agent
         sid = session_id_from_payload(payload)
-        live = investigation_agent.start(wiring, sid, payload.get("source"))
+        live = investigation_agent.start(wiring, sid, payload.get("source"), cwd=cwd)
         investigation_agent.spawn_poller(wiring, sid, str(INVESTIGATION_POLLER))
         discovery = storyboard_agent.session_start_text(
             wiring, cwd, sid, include_session_line=not bool(live),
