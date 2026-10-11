@@ -1,6 +1,6 @@
 {
   "name": "cardinal-codex-plugin",
-  "version": "0.26.5",
+  "version": "0.26.6",
   "description": "Connect Codex to Cardinal telemetry and MCP.",
   "author": {
     "name": "CardinalHQ",

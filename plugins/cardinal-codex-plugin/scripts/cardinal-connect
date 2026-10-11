@@ -132,12 +132,19 @@ def strip_managed_block(text: str) -> tuple[str, bool]:
     return (new_text + "\n" if new_text else ""), True
 
 
+# X-Cardinal-Client names this agent on every MCP request: Cardinal records
+# it as the producing client of the investigation events Codex posts through
+# Cardinal's MCP tools (a display claim, never identity).
+MCP_CLIENT = f"codex/{PLUGIN_VERSION}"
+
+
 def build_managed_block(mcp_url: str, api_key: str) -> str:
     return (
         f"{BEGIN_MARKER}\n"
         f"[mcp_servers.{MCP_SERVER_NAME}]\n"
         f"url = {toml_string(mcp_url)}\n"
-        f'http_headers = {{ "X-CardinalHQ-API-Key" = {toml_string(api_key)} }}\n'
+        f'http_headers = {{ "X-CardinalHQ-API-Key" = {toml_string(api_key)}, '
+        f'"X-Cardinal-Client" = {toml_string(MCP_CLIENT)} }}\n'
         f"{END_MARKER}\n"
     )
 
