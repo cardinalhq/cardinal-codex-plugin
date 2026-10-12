@@ -12,12 +12,14 @@ shared algorithms and the OTLP contract now come from `core/cardinal_core`.
 | `cardinal-status` | Shows the recorded Cardinal workspace and probes the configured ingest and MCP endpoints. |
 | `cardinal-disconnect` | Best-effort revokes Cardinal keys, removes managed Codex config/hooks, and deletes local state. |
 | `cardinal-decision` | Turns opt-in decision capture on/off and shows its status (see Decision capture). |
+| `cardinal-canvas` | Draws a storyboard scene's Canvas and critiques the PNGs the preview hook renders locally (shared `common/canvas` core). |
 | `cardinal-optimize-toolkit` | Mines the caller's last 30 days of session telemetry via the `cardinal` MCP server's `outcomes__*` tools for capability-fit recommendations, and on explicit confirmation writes the accepted artifact to `.codex/agents/<name>.toml`. Explicit-invocation only (W4.T4.2; see `docs/specs/toolkit-hive-mind.md` §4). |
 
 ## Layout
 
-- `hooks/cardinal-codex-telemetry.py` — the single telemetry hook
-  (SessionStart / UserPromptSubmit / Stop / SubagentStop). Codex-specific
+- `hooks/cardinal-codex-telemetry.py` — the single hook for every event
+  (SessionStart / UserPromptSubmit / Stop / SubagentStart / SubagentStop /
+  PreToolUse / PostToolUse; `--event` names the handler). Codex-specific
   logic lives here: transcript scraping with resume-line semantics
   (MAX_EVENTS_PER_STOP=512), tool-name normalization
   (`exec_command`→Bash, `apply_patch`→Edit with patch-target extraction,
@@ -32,7 +34,13 @@ shared algorithms and the OTLP contract now come from `core/cardinal_core`.
 - `scripts/` — `cardinal-connect` (device flow + probes from
   `cardinal_core.deviceflow`; the parse-aware TOML managed-block writer
   and the Codex `hooks.json` writer stay adapter-side), `cardinal-status`,
-  `cardinal-disconnect`.
+  `cardinal-disconnect`, `cardinal-checks` and `cardinal-behavior` (see
+  Checks preview).
+- `checks/skill/` — the Checks preview's opt-in skill template (installed
+  into `skills/checks/` by `cardinal-checks on`, never shipped there).
+- `agents/brainstorm.toml` — the `cardinal-brainstorm` custom agent;
+  `cardinal-connect` installs it in `~/.codex/agents/` (see Storyboard
+  authoring).
 - `tests/goldens/` — normalized OTLP/stdout fixtures captured from the
   pre-migration shipped plugin (v0.5.2) by `tests/capture_goldens.py`.
 - `tests/test_parity.py` — asserts the migrated hook is byte-equal to the
@@ -234,13 +242,23 @@ the pre-removal Semantic DAG hooks used `.*`). Tool calls that do not reach
 
 ## Automatic Investigation Storyboards
 
-Every connected Codex session now creates or reuses one private Investigation
-and Storyboard at SessionStart. The hook tells Codex to show its link in the
-first progress update, set the investigation question, and checkpoint material
-findings with captured or witnessed evidence as the work proceeds. When the
-server advertises projection, its projector updates that draft automatically;
-the worker does not create another Storyboard or author scenes. Publication and
-sharing remain explicit. No transcript or owner-input payload is supplied.
+Every connected Codex session creates or reuses one private Investigation and
+Storyboard at SessionStart. The session guidance (`cardinal_core.investigation_text`,
+the text every runtime gets) gives the labeled links: the Storyboard, a private
+draft until an act is published, and the Investigation timeline, which shows the
+live record before any publish and is the link to share. It tells Codex to show
+them in its first progress update, set the investigation question, and checkpoint
+material findings with captured or witnessed evidence as the work proceeds. When
+the server advertises projection, its projector updates that draft
+automatically; the worker does not create another Storyboard. Publication and
+sharing remain explicit. No transcript is supplied.
+
+The guidance is sent at SessionStart for every source (`startup`, `resume`,
+`clear`, `fork`, and `compact`: Codex fires SessionStart again after a
+compaction, before the next prompt). A prompt sends it again only when it
+changed (a bootstrap the poller completed after SessionStart, refreshed
+capabilities, owner input turned on or off); otherwise prompts carry no
+guidance.
 
 `scripts/cardinal-storyboard investigation link|question|checkpoint|events|ack
 --session SID` uses the shared Investigation transport, evidence promotion,
@@ -248,19 +266,177 @@ validation and idempotency. `checkpoint --help` lists the event types and fields
 checkpoint input is a JSON array on stdin. The session id is passed explicitly.
 A session joined to another author's Investigation cannot checkpoint or frame it.
 A shell holding `CARDINAL_INVESTIGATION_TOKEN` cannot use this author CLI.
+These commands reach Cardinal over the network: in Codex's `workspace-write`
+sandbox (network off) each one needs the user's approval. The MCP tools
+`storyboard__read_investigation_events` and `storyboard__post_investigation_event`
+read and post without that approval when no local evidence needs promoting.
 
 A detached, per-session poller retries transient bootstrap failures, refreshes
-capabilities and fetches advisory events. PostToolUse delivers its local inbox
-without network waits. Polling pauses while idle and exits with its Codex
-ancestor. Advisories retain their untrusted authority. Owner-input capture is
-not wired in the Codex adapter. `CARDINAL_STORYBOARD_SESSION_START=0` disables
-automatic bootstrap/guidance; `CARDINAL_INVESTIGATION_POLLER=0` disables polling.
+capabilities and fetches advisory events. Polling pauses while idle and exits
+with its Codex ancestor. Advisories keep their untrusted authority and are
+delivered as model context, never as owner input:
 
-Upgrade the plugin, run `scripts/cardinal-connect --repair-hooks`, and review and
-trust the updated Cardinal hooks in Codex. Start a new session to pick them up.
+- **At a tool boundary** (PostToolUse `ToolEvidence`): what was staged, then the
+  local inbox, then one owed challenge or directive re-surfaced; no network
+  wait. A subagent's tool call (its payload names `agent_id`; `session_id` is the
+  parent's) gets nothing, and the items wait for the main thread.
+- **At the turn's end** (Stop, `investigation_agent.turn_end`): the inbox; else,
+  when the poller has not read the events lately, one synchronous check; else
+  an open directive or the owner-decision reminders. What is found blocks the
+  stop (Codex wraps the reason as a `<hook_prompt>` item and UserPromptSubmit
+  does not fire for it, so advisory text never becomes owner input). Then the
+  owner-input outbox is flushed. All of it ends 5 s after the hook starts
+  (Stop's timeout is 10 s).
+- **At the next prompt**: what was staged (for example a storyboard re-look's
+  block) goes into `additionalContext`.
+
+`CARDINAL_STORYBOARD_SESSION_START=0` disables automatic bootstrap/guidance;
+`CARDINAL_INVESTIGATION_POLLER=0` disables polling.
+
+### Owner input
+
+When the server enables it for the session (`capabilities.owner_input`, the
+session authors its Investigation), the UserPromptSubmit hook records what
+you typed into the Investigation as owner input (`cardinal_core.owner_input.capture`,
+the gate every runtime shares): credentials scrubbed, at most 32 KiB, readable
+only by you and grantees you authorize.
+
+- **Disclosure first.** The first prompt that would be recorded is not: Codex
+  shows you a Cardinal `systemMessage` saying prompts are recorded to the
+  Investigation and how to turn it off, and recording starts with the next
+  prompt. Turning it off and on again shows the disclosure again first.
+- **Kill switch.** `CARDINAL_OWNER_INPUT=0` (or `false` / `off` / `no`) in the
+  environment, or `{"codex": "off"}` in `~/.cardinal/owner-input.json` (for the
+  Codex app, which does not see your shell's environment). Set, nothing is
+  recorded and the queued outbox is deleted at the next turn end.
+- **What is recorded.** Exactly the prompt text Codex's UserPromptSubmit hook
+  receives, which a live capture (codex-cli 0.160.1 and 0.162.1) showed is the
+  composer text: an `@file` mention is the path text, not the file's contents;
+  `$skill` mentions and a `/review` with custom instructions are sent as typed.
+  Never recorded: a subagent's prompt (payload `agent_id`), the prompts Codex
+  generates for `/review`'s presets and `/init`, slash commands that submit no
+  prompt (`/compact`). The same prompt typed twice is recorded twice.
+- **Bounded.** Recording finishes within 3.5 s of the hook's start (the hook's
+  timeout is 5 s and Codex discards a timed-out hook's output, the spend-limits
+  verdict with it); a prompt that cannot be posted in time is queued (0600) and
+  posted at the turn end or the next prompt. A spend-limits block wins: a
+  blocked prompt is not recorded.
+
+### Storyboard authoring
+
+- **Preview render** (PostToolUse `StoryboardPreview`, matcher
+  `^mcp__cardinal__storyboard__preview$`, timeout 150 s): renders every scene of
+  the preview result in your local Chrome/Chromium
+  (`skills/storyboard/scripts/render_preview.py --runtime codex`) and hands the
+  agent the PNG paths under `~/.codex/cardinal/storyboards/<id>/r<rev>/`, then the
+  link-preview cover and mock. No Chromium: said once per session.
+- **Hero upload and edit lookup** (PostToolUse `StoryboardAuthoring`, matcher
+  `^(mcp__cardinal__storyboard__publish|apply_patch)$`, timeout 10 s): after a
+  publish, the local render of the act's cover scene is uploaded for link
+  previews (`CARDINAL_STORYBOARD_HERO=0` turns it off); after an `apply_patch`,
+  the storyboards about the edited files (or the PR that last changed them) are
+  added as data, one lookup per new directory, at most six per session, within
+  4 s. Codex's PreToolUse output schema has `additionalContext`, but whether
+  Codex shows it to the model is not verified, so the lookup runs after the
+  edit.
+- **Evidence token**: Cardinal's `storyboard__create` / `add_act` / `preview`
+  results' evidence token is kept per session (`~/.cardinal/evidence/<session>/`),
+  so `cardinal-evidence promote` uploads cited evidence without the org key.
+- **Storyboard re-look**: a prompt whose branch or HEAD moved since the
+  session's last look starts a detached look (never on the prompt's clock);
+  its block is staged for the next tool or prompt boundary. A **SubagentStart**
+  hook gives a subagent the block the session's last look stored (no git, no
+  network).
+- **canvas skill** (`skills/canvas/`, the shared `common/canvas` core):
+  drawing a scene and critiquing the rendered PNGs.
+- **`cardinal-brainstorm` agent**: `cardinal-connect` installs
+  `agents/brainstorm.toml` as `~/.codex/agents/cardinal-brainstorm.toml` (Codex
+  discovers custom agents there; a plugin cannot ship one) and
+  `cardinal-disconnect` removes it. A file at that path without the plugin's
+  first-line marker is yours and is left alone.
+
+SessionStart also tells the user, once per machine, how to connect when Cardinal
+is not connected, and warns once per session when an MCP key is set without an
+MCP URL.
+
+### Upgrading: re-trust the hooks
+
+Upgrade the plugin, run `scripts/cardinal-connect --repair-hooks`, and start
+Codex. The repair needs no new key: it refreshes the launchers and hooks, and
+adds `[mcp_servers.cardinal-behavior]` to the managed block of a connection
+made before the Checks preview (`cardinal-checks on` / `status` print this
+command while it is missing). Codex lists the new and modified Cardinal hooks for review, and runs none of
+them until you trust them in the TUI. Every hook entry whose command or matcher
+changed must be trusted again (`codex exec` runs only trusted hooks unless
+`--dangerously-bypass-hook-trust` is given). Start a new session to pick them up.
 SessionStart has an eight-second budget for existing context plus the bounded
 bootstrap request. Older servers without bootstrap retain discovery behavior;
 servers without projection are described honestly as not automatically updating.
+
+### Platform limits
+
+What Codex can and can't do next to the Claude, Cursor and Gemini CLI plugins,
+feature by feature, with a citation for every limit: [`docs/parity.md`](../../docs/parity.md).
+
+- `/prompts:<name>` custom prompts do not exist in codex-cli 0.160.1 / 0.162.1
+  (the TUI answers "Unrecognized command"; `codex exec` passes the text
+  through literally), so there is no expanded custom-prompt shape to handle.
+- `/review` turns fire UserPromptSubmit with Codex's generated prompt but no
+  Stop; their advisories wait for the next tool or turn boundary.
+- An advisory that arrives after a turn's last tool call is delivered at that
+  turn's Stop (a block), or at the next tool boundary.
+
+## Checks preview (opt-in)
+
+Checks are reusable, evidence-backed decisions over telemetry (a contract the
+user approves, approved teaching examples, per-trace results with evidence),
+built on the `cardinal-behavior` MCP server. The preview is **off by
+default**; turn it on or off in your own terminal:
+
+```bash
+python3 scripts/cardinal-checks on       # install the checks skill; start a new Codex session
+python3 scripts/cardinal-checks off      # remove it
+python3 scripts/cardinal-checks status   # the setting, the installed skill, accepted checks
+```
+
+- **`cardinal-behavior` MCP server.** `cardinal-connect` registers it
+  as `[mcp_servers.cardinal-behavior]` inside the managed block of `~/.codex/config.toml` (through the stable launcher `~/.codex/cardinal/cardinal-behavior.py`, like the hooks, so a plugin upgrade does not dangle it; an unmanaged table of that name is left alone), launched as `scripts/cardinal-behavior --runtime codex`;
+  `cardinal-disconnect` removes it (only the managed one: a table of that
+  name outside the markers is yours and is kept). A connection made before
+  the Checks preview has none: `python3 scripts/cardinal-connect --repair-hooks`
+  adds it without a new key, and `cardinal-checks on` / `status` print that
+  command while it is missing. It is a local stdio server that Codex
+  starts outside its sandbox, so it can write the Checks ledger and read
+  range runs that a sandboxed agent cannot. It reads this runtime's
+  connection (`~/.codex/cardinal.json` `mcp_url` + `cardinal-secrets.json`
+  `mcp_api_key`); `CARDINAL_MCP_URL` with `CARDINAL_MCP_API_KEY` in its
+  environment overrides them (a URL without its key does not). No key is
+  written into the MCP registration. Its draft ledger and `enabled.json` are
+  private (0600 files in 0700 directories).
+- **The skill** (`cardinal-checks`, from `checks/skill/`: this plugin's
+  SKILL.md over the shared `common/checks/CORE.md`) is installed into
+  this plugin's `skills/checks/` (`plugin.json` `"skills": "./skills/"`) by `on` and removed by `off` (and by `cardinal-disconnect`). The SessionStart hook
+  reconciles that copy with the setting and, while the preview is on and
+  Cardinal is connected, adds the routing rule (answer with the query tools
+  first; a check only for per-trace judgments). Off: no text at all.
+- **Labels and reuse** go through MCP tools (`set_check_example`,
+  `approve_check_example`, `remove_check_example`, `get_check_draft`,
+  `lock_check_examples`, `list_accepted_checks`), never shell commands. The
+  ledger is `~/.codex/cardinal/checks/drafts/`; disconnect removes it.
+- **Range runs** (`execute_behavior_range`) run in a detached worker; the
+  agent follows one by polling `get_behavior_range` (each call waits up to
+  30 s for new events, and a completed run's summary comes back in it).
+  Claude Code listens with its Monitor tool instead; Codex has no
+  equivalent, so it polls.
+
+**Limit: a change takes effect at the next session; no skill reload or
+deny.** Claude Code's gate returns `reloadSkills` and denies its Skill tool
+while the preview is off. A Codex SessionStart hook can only add context
+(`hookSpecificOutput.additionalContext`; see the host-surface evidence above,
+https://learn.chatgpt.com/docs/hooks), and Codex has no skill tool call to
+deny: it lists the plugin's skills when the session starts and the model
+opens a SKILL.md itself. So `on` / `off` apply to sessions started
+afterwards; a running session keeps the skill list it started with.
 
 ## Storyboard associations
 
