@@ -1025,7 +1025,7 @@ def handle_stop(payload: dict[str, Any]) -> None:
             emit = lambda text: lines.append(text.replace("cardinal-storyboard investigation", investigation_agent.command(wiring)))
             ie.deliver_inbox(Path.home(), session_id, emit, stop=True,
                              stop_hook_active=payload.get("stop_hook_active") is True)
-            if not lines:
+            if not lines and not ie.supervision_stop(Path.home(), session_id, emit):
                 ie.remind_decisions(Path.home(), session_id, emit)
             if lines:
                 sys.stdout.write(json.dumps({"decision": "block", "reason": "\n\n".join(lines)}))
