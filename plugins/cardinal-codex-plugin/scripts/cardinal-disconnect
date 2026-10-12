@@ -28,6 +28,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+
 
 CODEX_DIR = Path.home() / ".codex"
 CONFIG_PATH = CODEX_DIR / "config.toml"
@@ -102,8 +104,18 @@ def read_secrets() -> dict:
 
 
 _ANY_TABLE_HEADER_RE = re.compile(r"^\s*\[")
+# [mcp_servers.cardinal] (Cardinal's MCP endpoint): removed wherever it sits.
+# connect refuses to write next to an unmanaged one, and a second table of
+# that name would be invalid TOML, so with the BEGIN marker present any
+# [mcp_servers.cardinal] is the managed one, possibly moved by Codex.
 _CARDINAL_TABLE_HEADER_RE = re.compile(
     r'^\s*\[mcp_servers\.(?:"cardinal"|cardinal)(?:\]|\.)'
+)
+# [mcp_servers.cardinal-behavior] (the local Checks / behavior MCP server):
+# removed only between the BEGIN and END markers. A user's own table of that
+# name (connect then writes none of its own) sits outside them and is kept.
+_BEHAVIOR_TABLE_HEADER_RE = re.compile(
+    r'^\s*\[mcp_servers\.(?:"cardinal-behavior"|cardinal-behavior)(?:\]|\.)'
 )
 
 
@@ -113,10 +125,11 @@ def strip_managed_block(text: str) -> tuple[str, bool]:
     The BEGIN/END markers are ADVISORY, not a deletion span: Codex rewrites
     config.toml itself and can move its own sections (e.g. [desktop],
     [hooks.state]) inside the marker span (issue #10). Removal is therefore
-    parse-aware — only the marker comment lines and the
-    [mcp_servers.cardinal] table (header through the line before the next
-    table header), wherever they sit, are removed. Foreign content that
-    drifted between the markers is preserved verbatim.
+    parse-aware — only the marker comment lines, the [mcp_servers.cardinal]
+    table (header through the line before the next table header) wherever it
+    sits, and an [mcp_servers.cardinal-behavior] table between the markers
+    are removed. Foreign content that drifted between the markers is
+    preserved verbatim; a cardinal-behavior table outside them is the user's.
 
     The BEGIN marker still gates the whole operation: without it the file
     is considered unmanaged and returned untouched, so a hand-written
@@ -128,16 +141,21 @@ def strip_managed_block(text: str) -> tuple[str, bool]:
         return text, False
     out: list[str] = []
     in_cardinal = False
+    in_span = False
     for line in text.splitlines(keepends=True):
         stripped = line.strip()
-        if stripped.startswith(BEGIN_MARKER) or stripped.startswith(END_MARKER):
+        if stripped.startswith(BEGIN_MARKER):
+            in_span = True
+            continue
+        if stripped.startswith(END_MARKER):
+            in_span = False
             continue
         if in_cardinal:
             if _ANY_TABLE_HEADER_RE.match(line):
                 in_cardinal = False  # table ended; fall through for this line
             else:
                 continue
-        if _CARDINAL_TABLE_HEADER_RE.match(line):
+        if _CARDINAL_TABLE_HEADER_RE.match(line) or (in_span and _BEHAVIOR_TABLE_HEADER_RE.match(line)):
             in_cardinal = True
             continue
         out.append(line)
@@ -208,6 +226,27 @@ def remove_hooks_config() -> bool:
     return changed
 
 
+# Custom agents cardinal-connect installed (its AGENT_FILES / AGENT_MARKER,
+# kept in lockstep): only a file that still starts with the marker is
+# removed; one the user took over (marker line deleted) is kept.
+AGENTS_DIR = CODEX_DIR / "agents"
+MANAGED_AGENTS = ("cardinal-brainstorm.toml",)
+AGENT_MARKER = "# Managed by cardinal-codex-plugin"
+
+
+def remove_managed_agents() -> list[Path]:
+    removed = []
+    for name in MANAGED_AGENTS:
+        path = AGENTS_DIR / name
+        try:
+            if path.read_text(encoding="utf-8").startswith(AGENT_MARKER):
+                path.unlink()
+                removed.append(path)
+        except (OSError, UnicodeDecodeError):
+            pass
+    return removed
+
+
 def revoke_key(host: str, key_id: str, plaintext: str | None) -> tuple[bool, str]:
     url = host.rstrip("/") + f"/api/maestro-keys/{key_id}/revoke"
     headers = {"content-type": "application/json"}
@@ -221,6 +260,23 @@ def revoke_key(host: str, key_id: str, plaintext: str | None) -> tuple[bool, str
         return False, f"HTTP {exc.code}"
     except (urllib.error.URLError, TimeoutError) as exc:
         return False, f"network error: {exc}"
+
+
+
+def remove_checks_skill(runtime: str) -> None:
+    """The Checks preview's skill copy in this plugin's skills/checks/
+    (cardinal-checks on): removed with the connection, before the runtime
+    dir (and its enabled.json) goes, so no session keeps a skill whose
+    setting is gone. Best-effort: a disconnect never fails on it."""
+    try:
+        sys.path.insert(0, str(PLUGIN_ROOT / "hooks"))
+        from cardinal_core import checks_install
+
+        dest = checks_install.install_dir(runtime, PLUGIN_ROOT)
+        if checks_install.uninstall(dest):
+            print(f"Removed the Checks preview skill {dest}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not remove the Checks preview skill: {exc}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -287,6 +343,9 @@ def main() -> int:
     if not removed_hooks:
         print(f"No managed Cardinal hooks found in {HOOKS_PATH}")
 
+    for agent in remove_managed_agents():
+        print(f"Removed {agent}")
+
     if SECRETS_PATH.exists():
         SECRETS_PATH.unlink()
         print(f"Removed {SECRETS_PATH}")
@@ -294,6 +353,8 @@ def main() -> int:
     if STATE_PATH.exists():
         STATE_PATH.unlink()
         print(f"Removed {STATE_PATH}")
+
+    remove_checks_skill("codex")
 
     if RUNTIME_DIR.exists():
         import shutil

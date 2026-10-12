@@ -64,6 +64,14 @@ END_MARKER = "# END cardinal-codex-plugin managed MCP server"
 UNMANAGED_CARDINAL_TABLE_RE = re.compile(
     r'(?m)^\s*\[mcp_servers\.(?:"cardinal"|cardinal)\]\s*$'
 )
+UNMANAGED_BEHAVIOR_TABLE_RE = re.compile(
+    r'(?m)^\s*\[mcp_servers\.(?:"cardinal-behavior"|cardinal-behavior)\]\s*$'
+)
+# The local cardinal-behavior MCP server (Checks preview, behavior tools),
+# launched through a stable launcher like the hooks (survives plugin upgrades).
+BEHAVIOR_SERVER_NAME = "cardinal-behavior"
+BEHAVIOR_LAUNCHER_PATH = LAUNCHER_DIR / "cardinal-behavior.py"
+BEHAVIOR_SCRIPT = PLUGIN_ROOT / "scripts" / "cardinal-behavior"
 
 
 def toml_string(value: str) -> str:
@@ -89,8 +97,18 @@ def clear_pending() -> None:
 
 
 _ANY_TABLE_HEADER_RE = re.compile(r"^\s*\[")
+# [mcp_servers.cardinal] (Cardinal's MCP endpoint): removed wherever it sits.
+# connect refuses to write next to an unmanaged one, and a second table of
+# that name would be invalid TOML, so with the BEGIN marker present any
+# [mcp_servers.cardinal] is the managed one, possibly moved by Codex.
 _CARDINAL_TABLE_HEADER_RE = re.compile(
     r'^\s*\[mcp_servers\.(?:"cardinal"|cardinal)(?:\]|\.)'
+)
+# [mcp_servers.cardinal-behavior] (the local Checks / behavior MCP server):
+# removed only between the BEGIN and END markers. A user's own table of that
+# name (connect then writes none of its own) sits outside them and is kept.
+_BEHAVIOR_TABLE_HEADER_RE = re.compile(
+    r'^\s*\[mcp_servers\.(?:"cardinal-behavior"|cardinal-behavior)(?:\]|\.)'
 )
 
 
@@ -100,10 +118,11 @@ def strip_managed_block(text: str) -> tuple[str, bool]:
     The BEGIN/END markers are ADVISORY, not a deletion span: Codex rewrites
     config.toml itself and can move its own sections (e.g. [desktop],
     [hooks.state]) inside the marker span (issue #10). Removal is therefore
-    parse-aware — only the marker comment lines and the
-    [mcp_servers.cardinal] table (header through the line before the next
-    table header), wherever they sit, are removed. Foreign content that
-    drifted between the markers is preserved verbatim.
+    parse-aware — only the marker comment lines, the [mcp_servers.cardinal]
+    table (header through the line before the next table header) wherever it
+    sits, and an [mcp_servers.cardinal-behavior] table between the markers
+    are removed. Foreign content that drifted between the markers is
+    preserved verbatim; a cardinal-behavior table outside them is the user's.
 
     The BEGIN marker still gates the whole operation: without it the file
     is considered unmanaged and returned untouched, so a hand-written
@@ -115,16 +134,21 @@ def strip_managed_block(text: str) -> tuple[str, bool]:
         return text, False
     out: list[str] = []
     in_cardinal = False
+    in_span = False
     for line in text.splitlines(keepends=True):
         stripped = line.strip()
-        if stripped.startswith(BEGIN_MARKER) or stripped.startswith(END_MARKER):
+        if stripped.startswith(BEGIN_MARKER):
+            in_span = True
+            continue
+        if stripped.startswith(END_MARKER):
+            in_span = False
             continue
         if in_cardinal:
             if _ANY_TABLE_HEADER_RE.match(line):
                 in_cardinal = False  # table ended; fall through for this line
             else:
                 continue
-        if _CARDINAL_TABLE_HEADER_RE.match(line):
+        if _CARDINAL_TABLE_HEADER_RE.match(line) or (in_span and _BEHAVIOR_TABLE_HEADER_RE.match(line)):
             in_cardinal = True
             continue
         out.append(line)
@@ -138,14 +162,27 @@ def strip_managed_block(text: str) -> tuple[str, bool]:
 MCP_CLIENT = f"codex/{PLUGIN_VERSION}"
 
 
-def build_managed_block(mcp_url: str, api_key: str) -> str:
+def build_behavior_table() -> str:
+    """[mcp_servers.cardinal-behavior]: the stdio server, run by Codex outside
+    its sandbox with --runtime codex (its connection is ~/.codex/cardinal.json
+    + cardinal-secrets.json; no key in this file)."""
+    args = [str(BEHAVIOR_LAUNCHER_PATH), "--runtime", "codex"]
+    return (
+        f"[mcp_servers.{BEHAVIOR_SERVER_NAME}]\n"
+        f'command = "python3"\n'
+        f"args = [{', '.join(toml_string(a) for a in args)}]\n"
+    )
+
+
+def build_managed_block(mcp_url: str, api_key: str, behavior: bool = True) -> str:
     return (
         f"{BEGIN_MARKER}\n"
         f"[mcp_servers.{MCP_SERVER_NAME}]\n"
         f"url = {toml_string(mcp_url)}\n"
         f'http_headers = {{ "X-CardinalHQ-API-Key" = {toml_string(api_key)}, '
         f'"X-Cardinal-Client" = {toml_string(MCP_CLIENT)} }}\n'
-        f"{END_MARKER}\n"
+        + (f"\n{build_behavior_table()}" if behavior else "")
+        + f"{END_MARKER}\n"
     )
 
 
@@ -157,8 +194,13 @@ def write_codex_config(mcp_url: str, api_key: str) -> Path | None:
             f"Refusing to write because {CONFIG_PATH} already contains an unmanaged "
             "[mcp_servers.cardinal] table. Remove or rename that table, then rerun."
         )
+    behavior = not UNMANAGED_BEHAVIOR_TABLE_RE.search(text_without_managed)
+    if not behavior:
+        print(f"WARN {CONFIG_PATH} already has an unmanaged [mcp_servers.cardinal-behavior] table; "
+              "left as it is (the Checks preview needs it to run this plugin's scripts/cardinal-behavior "
+              "--runtime codex).")
 
-    block = build_managed_block(mcp_url, api_key)
+    block = build_managed_block(mcp_url, api_key, behavior=behavior)
     new_text = text_without_managed.rstrip()
     if new_text:
         new_text += "\n\n"
@@ -168,6 +210,48 @@ def write_codex_config(mcp_url: str, api_key: str) -> Path | None:
     backup_path = backup(CONFIG_PATH)
     atomic_write(CONFIG_PATH, new_text)
     return backup_path
+
+
+def _behavior_table_in_span(text: str) -> bool:
+    in_span = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(BEGIN_MARKER):
+            in_span = True
+        elif stripped.startswith(END_MARKER):
+            in_span = False
+        elif in_span and _BEHAVIOR_TABLE_HEADER_RE.match(line):
+            return True
+    return False
+
+
+def ensure_behavior_table(dry_run: bool = False) -> str:
+    """Add [mcp_servers.cardinal-behavior] to an existing managed block
+    (a connection made before the Checks preview has none). Needs no key:
+    the table names only the stable launcher. Returns what happened:
+    "added", "present" (managed or the user's own), "no-block" (no managed
+    block: not connected, or --telemetry-only) or "no-end" (an END marker
+    is missing; reconnect with --rotate)."""
+    text = CONFIG_PATH.read_text() if CONFIG_PATH.exists() else ""
+    if BEGIN_MARKER not in text:
+        return "no-block"
+    if _behavior_table_in_span(text) or UNMANAGED_BEHAVIOR_TABLE_RE.search(text):
+        return "present"
+    lines = text.splitlines(keepends=True)
+    end = next((i for i, line in enumerate(lines) if line.strip().startswith(END_MARKER)), None)
+    if end is None:
+        return "no-end"
+    if dry_run:
+        return "added"
+    before = "".join(lines[:end])
+    if before and not before.endswith("\n"):
+        before += "\n"
+    if before and not before.endswith("\n\n"):
+        before += "\n"
+    new_text = before + build_behavior_table() + "".join(lines[end:])
+    backup(CONFIG_PATH)
+    atomic_write(CONFIG_PATH, new_text)
+    return "added"
 
 
 def load_json_object(path: Path, label: str) -> dict:
@@ -183,6 +267,8 @@ def load_json_object(path: Path, label: str) -> dict:
 
 
 STORYBOARD_CONTEXT_MATCHER = "^mcp__cardinal__storyboard__(create|add_act|publish|find)$"
+STORYBOARD_PREVIEW_MATCHER = "^mcp__cardinal__storyboard__preview$"
+STORYBOARD_AUTHORING_MATCHER = "^(mcp__cardinal__storyboard__publish|apply_patch)$"
 
 
 def managed_hook_command(event_name: str) -> str:
@@ -272,10 +358,26 @@ def render_launcher() -> str:
     return LAUNCHER_TEMPLATE.format(fallback_root_repr=repr(str(PLUGIN_ROOT)))
 
 
+def render_behavior_launcher() -> str:
+    """The same stable launcher, resolving scripts/cardinal-behavior (the
+    cardinal-behavior MCP server) instead of the telemetry hook."""
+    text = render_launcher()
+    for old, new in (('"""cardinal-codex-plugin telemetry launcher (stable path).',
+                      '"""cardinal-codex-plugin cardinal-behavior MCP launcher (stable path).'),
+                     ('TELEMETRY_REL = Path("hooks") / "cardinal-codex-telemetry.py"',
+                      'TELEMETRY_REL = Path("scripts") / "cardinal-behavior"')):
+        if old not in text:
+            raise RuntimeError("launcher template changed; update render_behavior_launcher")
+        text = text.replace(old, new)
+    return text
+
+
 def write_launcher() -> None:
     LAUNCHER_DIR.mkdir(parents=True, exist_ok=True)
     atomic_write(LAUNCHER_PATH, render_launcher())
     LAUNCHER_PATH.chmod(0o755)
+    atomic_write(BEHAVIOR_LAUNCHER_PATH, render_behavior_launcher())
+    BEHAVIOR_LAUNCHER_PATH.chmod(0o755)
 
 
 def managed_hook_group(event_name: str, timeout: int, status_message: str | None = None) -> dict:
@@ -359,6 +461,11 @@ def write_hooks_config() -> Path | None:
     hooks.setdefault("SubagentStop", []).append(
         managed_hook_group("SubagentStop", 5, "Reporting Cardinal subagent telemetry")
     )
+    # A subagent starts without the session's SessionStart context: it gets
+    # the storyboard discovery block the session's last look stored. Local
+    # files only (no git, no network). No statusMessage: it would flash on
+    # every spawn.
+    hooks.setdefault("SubagentStart", []).append(managed_hook_group("SubagentStart", 5))
     # Hook-side cardinal.decision emission: the agent's sandboxed
     # `cardinal-decision record` only prints a marker. Exact matcher "Bash"
     # (Codex's hook name for exec_command); the handler exits at once
@@ -378,6 +485,25 @@ def write_hooks_config() -> Path | None:
         "timeout": 3,
     }]}
     hooks["PostToolUse"].append(evidence_group)
+    # Storyboard preview: renders every scene of Cardinal's storyboard__preview
+    # result locally (the user's Chromium) and hands the agent the PNG paths.
+    # Its own group with a long timeout (cardinal_core.storyboard_authoring
+    # PREVIEW_HOOK_TIMEOUT_S = 150; the render stops itself at 135 s), so the
+    # evidence group keeps its 3 s.
+    hooks["PostToolUse"].append({"matcher": STORYBOARD_PREVIEW_MATCHER, "hooks": [{
+        "type": "command",
+        "command": managed_hook_command("StoryboardPreview"),
+        "timeout": 150,
+        "statusMessage": "Rendering the Cardinal storyboard preview",
+    }]})
+    # storyboard__publish's hero upload (one PUT, 7 s) and apply_patch's edit
+    # lookup (the storyboards about the edited files; one find per new
+    # directory, 4 s in all).
+    hooks["PostToolUse"].append({"matcher": STORYBOARD_AUTHORING_MATCHER, "hooks": [{
+        "type": "command",
+        "command": managed_hook_command("StoryboardAuthoring"),
+        "timeout": 10,
+    }]})
     # Storyboard context stamping: fills an absent session_id / context on
     # Cardinal's storyboard tools (hooks/cardinal-codex-telemetry.py
     # handle_storyboard_context). A regex matcher: only those calls start
@@ -396,8 +522,51 @@ def write_hooks_config() -> Path | None:
     return backup_path
 
 
+# Codex custom agents (agent roles): standalone TOML files Codex discovers in
+# ~/.codex/agents/ (codex-rs agent-roles discovery; verified live on
+# codex-cli 0.162.1). A plugin manifest cannot ship one, so connect installs
+# the plugin's agents/*.toml there, marked as managed on their first line, and
+# cardinal-disconnect removes the marked files. A file at the same path
+# without the marker is the user's and is never overwritten.
+AGENTS_SOURCE_DIR = PLUGIN_ROOT / "agents"
+AGENTS_DIR = CODEX_DIR / "agents"
+AGENT_FILES = {"brainstorm.toml": "cardinal-brainstorm.toml"}
+AGENT_MARKER = "# Managed by cardinal-codex-plugin"
+
+
+def install_agents() -> list[str]:
+    """Install or refresh the plugin's custom agents. Idempotent: an
+    unchanged file is not rewritten. Returns a line per agent for the
+    connect output."""
+    report: list[str] = []
+    for source_name, installed_name in AGENT_FILES.items():
+        source = AGENTS_SOURCE_DIR / source_name
+        target = AGENTS_DIR / installed_name
+        try:
+            text = source.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if target.exists():
+            try:
+                current = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                current = ""
+            if not current.startswith(AGENT_MARKER):
+                report.append(f"Kept your own {target} (no Cardinal marker); the Cardinal agent was not installed")
+                continue
+            if current == text:
+                report.append(f"Cardinal agent up to date: {target}")
+                continue
+        AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+        atomic_write(target, text)
+        report.append(f"Wrote Cardinal agent to {target}")
+    return report
+
+
 def repair_hooks(dry_run: bool = False) -> int:
-    """Rewrite the managed hook config without rotating Cardinal credentials.
+    """Rewrite the managed hook config without rotating Cardinal credentials,
+    and register the cardinal-behavior MCP server in an existing managed
+    block that lacks it (an upgrade from before the Checks preview).
 
     Also the supported way to clear Semantic DAG hook entries left behind
     by installs that predate the skill's removal.
@@ -410,6 +579,9 @@ def repair_hooks(dry_run: bool = False) -> int:
             "would_write": {
                 "codex_hooks": str(HOOKS_PATH),
                 "telemetry_launcher": str(LAUNCHER_PATH),
+                "behavior_launcher": str(BEHAVIOR_LAUNCHER_PATH),
+                "codex_config": str(CONFIG_PATH) if ensure_behavior_table(dry_run=True) == "added" else None,
+                "codex_agents": [str(AGENTS_DIR / name) for name in AGENT_FILES.values()],
             },
             "plugin_root": str(PLUGIN_ROOT),
             "plugin_version": PLUGIN_VERSION,
@@ -418,17 +590,29 @@ def repair_hooks(dry_run: bool = False) -> int:
 
     write_launcher()
     print(f"Wrote Cardinal telemetry launcher to {LAUNCHER_PATH}")
+    print(f"Wrote Cardinal behavior MCP launcher to {BEHAVIOR_LAUNCHER_PATH}")
+    behavior = ensure_behavior_table()
+    if behavior == "added":
+        print(f"Registered the {BEHAVIOR_SERVER_NAME} MCP server in {CONFIG_PATH}")
+    elif behavior == "no-block":
+        print(f"No managed Cardinal MCP block in {CONFIG_PATH}, so the {BEHAVIOR_SERVER_NAME} MCP server "
+              "was not registered (connect with MCP: cardinal-connect --rotate).")
+    elif behavior == "no-end":
+        print(f"WARN The managed Cardinal MCP block in {CONFIG_PATH} has no END marker; the "
+              f"{BEHAVIOR_SERVER_NAME} MCP server was not registered. Re-run cardinal-connect --rotate.")
     hooks_backup = write_hooks_config()
     print(f"Wrote Cardinal hooks to {HOOKS_PATH}")
     if hooks_backup:
         print(f"Hooks backup: {hooks_backup}")
+    for line in install_agents():
+        print(line)
 
     if STATE_PATH.exists():
         state = load_json_object(STATE_PATH, "cardinal.json")
         state["plugin_version"] = PLUGIN_VERSION
         atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
         print(f"Updated Cardinal state version in {STATE_PATH}")
-    print("Restart Codex so it reloads the repaired hook config.")
+    print("Restart Codex so it reloads the repaired hook and MCP config.")
     return 0
 
 
@@ -580,6 +764,7 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
                     "codex_config": str(CONFIG_PATH) if mcp else None,
                     "codex_hooks": str(HOOKS_PATH),
                     "telemetry_launcher": str(LAUNCHER_PATH),
+                    "codex_agents": [str(AGENTS_DIR / name) for name in AGENT_FILES.values()],
                     "state": str(STATE_PATH),
                     "secrets": str(SECRETS_PATH),
                     "ingest_endpoint": (ingest or {}).get("endpoint"),
@@ -620,11 +805,14 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
 
     write_launcher()
     print(f"Wrote Cardinal telemetry launcher to {LAUNCHER_PATH}")
+    print(f"Wrote Cardinal behavior MCP launcher to {BEHAVIOR_LAUNCHER_PATH}")
 
     hooks_backup = write_hooks_config()
     print(f"Wrote Cardinal hooks to {HOOKS_PATH}")
     if hooks_backup:
         print(f"Hooks backup: {hooks_backup}")
+    for line in install_agents():
+        print(line)
 
     write_state(bundle, args.host, deployment_env, args.telemetry_only)
     print(f"Wrote Cardinal state to {STATE_PATH}")
@@ -671,7 +859,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--repair-hooks",
         action="store_true",
-        help="Refresh the Cardinal launcher and hooks without rotating credentials.",
+        help="Refresh the Cardinal launchers and hooks, and register the cardinal-behavior MCP "
+             "server, without rotating credentials.",
     )
     parser.add_argument(
         "--telemetry-only",
