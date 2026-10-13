@@ -628,8 +628,9 @@ def observe_storyboard_token(payload: dict[str, Any]) -> None:
     """After Cardinal's storyboard__create / add_act / preview: keep the
     result's evidence token for this session (storyboard_authoring.
     observe_cardinal_result: `cardinal-evidence promote` then uploads cited
-    evidence without the org key). Every other tool returns before the
-    import. Local only; never raises."""
+    evidence without the org key); after a successful storyboard__checkpoint:
+    hold this session's evidence while space allows. Every other tool
+    returns before the import. Local only; never raises."""
     try:
         name = tool_name_of(payload)
         if not (isinstance(name, str) and name.startswith("mcp__cardinal__storyboard__")):
