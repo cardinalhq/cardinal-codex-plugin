@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""cardinal-wake — owner-woken sessions (Codex adapter).
+
+Run it in your own terminal (not through the agent):
+    cardinal-wake enable [--launch]   install the per-user launchd agent (macOS);
+                                      --launch also lets eligible Codex CLI sessions resume
+    cardinal-wake disable             remove it
+    cardinal-wake status              the setting, disabled runtimes, recent wakes, candidate sessions
+    cardinal-wake run [--once] [--dry-run]
+    cardinal-wake reenable codex      after a failed post-run sandbox check
+
+When you post an owner decision on an Investigation page addressed to a
+stopped Codex CLI session that only ever ran -s workspace-write or
+-s read-only, the waker resumes it in that same sandbox with approvals off:
+    codex exec -s <mode> -c approval_policy="never" resume <session> "<wake prompt>"
+Everything else (Claude Code, the Codex desktop app, a session that ever ran
+danger-full-access, a session still open) gets a notification only.
+
+`enable` copies this plugin's cardinal_core and a small runner into
+~/.cardinal/wake/lib/ (re-copied by every enable), so launchd never points
+into a versioned plugin directory. The implementation is
+cardinal_core.session_wake (shared with the Claude Code adapter); see
+docs/specs/resume-and-wake.md §5.
+"""
+
+import sys
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PLUGIN_ROOT / "hooks"))
+from cardinal_core import session_wake  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(session_wake.cli_main(sys.argv[1:], runtime="codex", plugin_root=PLUGIN_ROOT))
