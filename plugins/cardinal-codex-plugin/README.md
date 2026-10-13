@@ -35,7 +35,7 @@ shared algorithms and the OTLP contract now come from `core/cardinal_core`.
   `cardinal_core.deviceflow`; the parse-aware TOML managed-block writer
   and the Codex `hooks.json` writer stay adapter-side), `cardinal-status`,
   `cardinal-disconnect`, `cardinal-checks` and `cardinal-behavior` (see
-  Checks preview), `cardinal-wake` (see Owner-woken sessions).
+  Checks preview).
 - `checks/skill/` — the Checks preview's opt-in skill template (installed
   into `skills/checks/` by `cardinal-checks on`, never shipped there).
 - `agents/brainstorm.toml` — the `cardinal-brainstorm` custom agent;
@@ -439,72 +439,22 @@ deny: it lists the plugin's skills when the session starts and the model
 opens a SKILL.md itself. So `on` / `off` apply to sessions started
 afterwards; a running session keeps the skill list it started with.
 
-## Owner-woken sessions
+## Resuming a session
 
-A stopped Codex session sees nothing until you type into it again. With
-wake on, an **owner decision** you post on its Investigation page,
-addressed to that session, shows a macOS notification on this machine, and
-one command (or one click) resumes the session in your own terminal.
+The storyboard's Sessions panel in the Cardinal web app gives each session's
+resume command and a prompt to continue it with. Owner decisions addressed
+to a session are delivered by this plugin's investigation hooks at its next
+tool boundary.
 
-```bash
-python3 scripts/cardinal-wake enable                     # install the per-user launchd agent (macOS)
-python3 scripts/cardinal-wake status                     # the setting, recent notifications, resume commands
-python3 scripts/cardinal-wake run --dry-run              # what the next pass would do; notifies nothing
-python3 scripts/cardinal-wake resume <session>           # resume it here (a unique 8+ hex prefix is enough)
-python3 scripts/cardinal-wake resume <session> --print   # show the command and its directory only
-python3 scripts/cardinal-wake disable                    # remove the launchd agent
+**Removed: `cardinal-wake`** (plugin 0.31.0). The macOS notifier and its
+`cardinal-wake resume` are gone. If you ran `cardinal-wake enable`,
+remove what it installed:
+
+```sh
+launchctl bootout gui/$(id -u)/io.cardinalhq.wake
+rm ~/Library/LaunchAgents/io.cardinalhq.wake.plist
+rm -rf ~/.cardinal/wake
 ```
-
-**What reaches you.** Only an owner decision you post from your signed-in
-Cardinal web session, addressed to a session on this machine, counts; never
-anything an agent posts. The waker reads it straight from Cardinal with the
-Cardinal key of the plugin whose session it is (this plugin's: `~/.codex/cardinal.json` `mcp_url` + `cardinal-secrets.json`
-`mcp_api_key`), never from
-local files. Each decision is one macOS notification naming the runtime,
-the session (first 8 characters of its id) and the Investigation (its id and
-host), never the decision's text; at most 3 per session and 10 in all per
-rolling day (the rest follow later). A decision posted without "Resume this
-session if it has stopped", or older than 7 days, is notified the same way.
-
-**The notification.** For a session whose window is still open it says to
-switch to that window. For a stopped session it ends with
-`Resume: ~/.cardinal/wake/lib/cardinal-wake resume <first 8 of the id>`:
-run that in your terminal, or install
-[terminal-notifier](https://github.com/julienXX/terminal-notifier)
-(`brew install terminal-notifier`) and click the notification: Terminal
-opens and runs it (through a private `~/.cardinal/wake/resume/<id>.command`).
-
-**`resume`.** It finds the session by Codex's own rollout
-(`~/.codex/sessions/**/rollout-*-<id>.jsonl`) and its working directory
-only from the rollout's `session_meta` for that id, never from the
-(agent-writable) Investigation binding, and refuses if that directory is
-gone. A Codex CLI session (`codex` or `codex exec`) then runs, in that
-directory, `codex resume <session> "<wake prompt>"`: the session continues
-with the sandbox, approvals and config you run Codex with. A Codex desktop
-app session instead opens in the app (`open codex://threads/<session>`);
-continue there.
-The wake prompt names the decision's number and Investigation (never its
-text) and is listed as a machine prompt, so the resumed turn is never
-recorded as owner input. The resumed session also receives the decision
-through this plugin's investigation hooks, as any session does.
-`resume --print` shows the command and its directory without running them;
-`status` lists candidate sessions with their resume commands.
-
-**Nothing is ever started unattended.** The waker only notifies; you resume,
-in your own terminal, with your own settings and permissions, and you see
-everything the session does ([`docs/specs/resume-and-wake.md`](../../docs/specs/resume-and-wake.md) v4). `enable --launch`, from earlier
-versions, is refused with a one-line message. `enable` copies this plugin's
-`cardinal_core` and a small runner into `~/.cardinal/wake/lib/` (every enable
-copies them again, so a plugin upgrade never leaves the agent pointing at a
-removed version) and runs it every 45 s with a Python that resolves outside
-your home directory, your repositories, temp dirs and version-manager shims,
-in isolated mode (`-I -S`), with a system-only PATH. `disable` removes the
-launchd agent.
-
-After updating the plugin, run `cardinal-wake enable` again: it refreshes the
-stable copy in `~/.cardinal/wake/lib/` (until then `status` says the
-installed runner is out of date, and notifications ask for it instead of
-naming the resume command).
 
 ## Storyboard associations
 
