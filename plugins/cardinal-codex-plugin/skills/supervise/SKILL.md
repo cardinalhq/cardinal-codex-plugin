@@ -27,7 +27,7 @@ Codex has no background listener. Each pass, block on the watch until there is s
 to review:
 
 ```
-python3 -I <this-skill-directory>/../../scripts/cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --follow --timeout 600 --max 1
+python3 -I <this-skill-directory>/../../scripts/cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --follow --timeout 600 --max 1 --session <your_sid>
 ```
 
 Starting from your cursor file, the watch signals only events you have not committed, so
@@ -37,6 +37,12 @@ It returns as soon as new events arrive (one line each, your own posts excluded)
 ten quiet minutes. Then run one pass of CORE.md's review loop through your cursor file,
 sweeping the worker's new activity even when the watch timed out, and start the watch
 again. Never write sleep-and-reread loops.
+
+## Owner decisions
+
+When the owner types `decide: …`, `approve <id>` or `reject <id>`, Cardinal's prompt hook
+shows them the outcome and gives you the same line. Confirm it in one line; run nothing to
+send or approve it. No Cardinal line means nothing was sent; say so.
 
 ## Doing your own checks
 
