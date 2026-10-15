@@ -44,6 +44,21 @@ When the owner types `decide: …`, `approve <id>` or `reject <id>`, Cardinal's 
 shows them the outcome and gives you the same line. Confirm it in one line; run nothing to
 send or approve it. No Cardinal line means nothing was sent; say so.
 
+## Fresh-context passes (step backs)
+
+Run each pass (CORE.md, Step backs) as a separate read-only Codex on the copy `budget pass`
+wrote:
+
+```
+codex exec --ignore-user-config --ignore-rules --disable hooks --disable apps --disable plugins --sandbox read-only --ephemeral -C <code checkout> - < <the copy>
+```
+
+Keep every flag: the sandbox covers only shell commands; your config's MCP servers, apps and
+hooks would give the pass write tools and Cardinal context. Its final message is the answer.
+It needs network: ask once, with the Cardinal commands. Run the two passes one after the
+other. If one fails, tell the owner the step back needs a Claude supervisor; for a plan, answer
+the estimator copy yourself.
+
 ## Doing your own checks
 
 Reproduce claims read-only: read files, `git log` / `git diff`, Cardinal query tools
