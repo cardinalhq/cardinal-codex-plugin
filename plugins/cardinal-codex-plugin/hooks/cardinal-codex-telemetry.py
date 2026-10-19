@@ -1517,6 +1517,11 @@ def handle_session_start(payload: dict[str, Any]) -> None:
             pass
         parts.append(context)
     try:
+        # An ephemeral thread (transcript_path null: no rollout is kept, e.g.
+        # the Codex app's ambient next-message suggestions, a new one every
+        # few minutes) gets no investigation, storyboard or discovery.
+        if "transcript_path" in payload and not payload.get("transcript_path"):
+            raise LookupError("ephemeral thread")
         # The session id line (any directory: an incident storyboard needs no
         # repo) + the storyboards that may relate to this checkout. Bounded
         # bounded alongside bootstrap within hooks.json's 8 s.
