@@ -1718,6 +1718,15 @@ def main() -> None:
             handle_post_tool_use(payload)
         elif args.event == EVIDENCE_EVENT:
             handle_tool_evidence(payload)
+        elif args.event == "CoordinationGate":
+            from cardinal_core import investigation_gate_runtime as gate_runtime
+            wiring = storyboard_wiring()
+            result = gate_runtime.dispatch(payload, runtime="codex", home=Path.home(),
+                                           connection=wiring.connection, client=wiring.client,
+                                           hook=Path(__file__), environ=os.environ)
+            if result:
+                sys.stdout.write(json.dumps(result))
+                sys.stdout.flush()
         elif args.event == STORYBOARD_CONTEXT_EVENT:
             handle_storyboard_context(payload)
         elif args.event == STORYBOARD_PREVIEW_EVENT:

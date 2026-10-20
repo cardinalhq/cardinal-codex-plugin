@@ -509,6 +509,10 @@ def write_hooks_config() -> Path | None:
     # handle_storyboard_context). A regex matcher: only those calls start
     # the hook. Local git + a gh lookup capped at 2 s.
     hooks.setdefault("PreToolUse", []).append({
+        "matcher": "Bash|apply_patch",
+        "hooks": [{"type": "command", "command": managed_hook_command("CoordinationGate"), "timeout": 5}],
+    })
+    hooks["PreToolUse"].append({
         "matcher": STORYBOARD_CONTEXT_MATCHER,
         "hooks": [{
             "type": "command",
