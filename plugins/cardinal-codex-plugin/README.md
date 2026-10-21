@@ -15,23 +15,26 @@ shared algorithms and the OTLP contract now come from `core/cardinal_core`.
 | `cardinal-canvas` | Draws a storyboard scene's Canvas and critiques the PNGs the preview hook renders locally (shared `common/canvas` core). |
 | `cardinal-optimize-toolkit` | Mines the caller's last 30 days of session telemetry via the `cardinal` MCP server's `outcomes__*` tools for capability-fit recommendations, and on explicit confirmation writes the accepted artifact to `.codex/agents/<name>.toml`. Explicit-invocation only (W4.T4.2; see `docs/specs/toolkit-hive-mind.md` §4). |
 
-## Coordination gate (opt-in preview)
+## Automatic agent coordination
 
-Version 0.38.0 adds a synchronous coordination gate for the validated Codex CLI
-`Bash` and `apply_patch` paths. It checks fresh collaborator contributions before
-declared actions, retains pending content durably and requires explicit handling
-before the agent chooses its next action again. Installing the plugin leaves
-the gate off. After updating, reconnect and trust the current hooks before
-attempting activation; activation also requires actual transport probes.
+Version 0.39.0 automatically checks fresh collaborator feedback before native
+edits and the declared direct commit, push, merge and verdict paths. It retains
+pending feedback until explicit handling, then the agent chooses its next action
+again. Connected supported CLI sessions need no mode setting, policy file or
+enable command. Codex installations need current registered/trusted hooks.
 
-The server must advertise `event_snapshot` version 1. Enablement requires a
-session-specific policy and `CARDINAL_COORDINATION_MODE=direct-cli`; there is no
-automatic activation for existing sessions. See the
-[runtime and operator contract](https://github.com/cardinalhq/cardinal-agent-plugins/blob/main/docs/specs/coordination-gate-runtime.md)
-for setup, `gate-*` commands, rollback and the exact coverage limits. Unsupported
-wrappers, suppressed code-mode rejections and interactive input remain outside
-coverage. Actual hook crashes and timeouts can fail open. This preview does not
-claim desktop coverage or Phase 4 performance/fleet acceptance.
+Agents use `investigation request` to declare required results and dependent
+actions. Replies can be complete, blocked, abstain or reject; only the requester's
+exact-result acceptance or explicit reasoned cancellation releases a dependency.
+Unrelated actions remain available after feedback handling. See the
+[request commands](https://github.com/cardinalhq/cardinal-agent-plugins/blob/main/docs/specs/coordination-requests.md)
+and [runtime contract](https://github.com/cardinalhq/cardinal-agent-plugins/blob/main/docs/specs/coordination-gate-runtime.md).
+The server must advertise event_snapshot and coordination_requests version 1.
+
+Coverage remains the validated direct CLI/native tool forms. Desktop/interactive
+paths, wrappers, arbitrary JavaScript effects, suppressed code-mode rejections
+and continuing stdin are outside coverage. Actual hook crashes/timeouts can fail
+open. Broad performance and fleet acceptance remain separate work.
 
 ## Layout
 
